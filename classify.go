@@ -1,6 +1,9 @@
 package main
 
-import "strings"
+import (
+	"math"
+	"strings"
+)
 
 const hardTol = 0.3 // Å — vdW overlap tolerance for clash detection
 
@@ -194,4 +197,84 @@ func noHardClash(pos Vec3, probeR, tol float64, heavy []heavyAtom) bool {
 		}
 	}
 	return true
+}
+
+// clashGrid is a spatial hash that makes clash checks O(1) instead of
+// O(protein_atoms). Cell size must be ≥ max expected clash distance (~3.5 Å).
+type clashGrid struct {
+	cells    map[[3]int][]int
+	atoms    []heavyAtom
+	cellSize float64
+	origin   Vec3
+}
+
+func newClashGrid(atoms []heavyAtom) *clashGrid {
+	const cellSize = 4.0 // Å — larger than max vdW sum (~3.8 Å), so ±1 cell suffices
+	g := &clashGrid{cells: make(map[[3]int][]int, len(atoms)), atoms: atoms, cellSize: cellSize}
+	if len(atoms) == 0 {
+		return g
+	}
+	g.origin = atoms[0].pos
+	for _, a := range atoms {
+		if a.pos.X < g.origin.X { g.origin.X = a.pos.X }
+		if a.pos.Y < g.origin.Y { g.origin.Y = a.pos.Y }
+		if a.pos.Z < g.origin.Z { g.origin.Z = a.pos.Z }
+	}
+	// Pad by one cell so indices are always non-negative.
+	g.origin.X -= cellSize
+	g.origin.Y -= cellSize
+	g.origin.Z -= cellSize
+	for i, a := range atoms {
+		k := g.gridKey(a.pos)
+		g.cells[k] = append(g.cells[k], i)
+	}
+	return g
+}
+
+func (g *clashGrid) gridKey(pos Vec3) [3]int {
+	return [3]int{
+		int(math.Floor((pos.X - g.origin.X) / g.cellSize)),
+		int(math.Floor((pos.Y - g.origin.Y) / g.cellSize)),
+		int(math.Floor((pos.Z - g.origin.Z) / g.cellSize)),
+	}
+}
+
+// clashFree returns true when pos does not overlap any protein atom.
+func (g *clashGrid) clashFree(pos Vec3, probeR, tol float64) bool {
+	k := g.gridKey(pos)
+	for dx := -1; dx <= 1; dx++ {
+		for dy := -1; dy <= 1; dy++ {
+			for dz := -1; dz <= 1; dz++ {
+				nk := [3]int{k[0] + dx, k[1] + dy, k[2] + dz}
+				for _, i := range g.cells[nk] {
+					a := g.atoms[i]
+					if pos.Sub(a.pos).Norm() < a.vdwR+probeR-tol {
+						return false
+					}
+				}
+			}
+		}
+	}
+	return true
+}
+
+// countNearby returns the number of protein atoms at distance [minD, maxD] from pos.
+// Uses ±2-cell neighbourhood (covers up to 8 Å with default 4 Å cells).
+func (g *clashGrid) countNearby(pos Vec3, minD, maxD float64) int {
+	k := g.gridKey(pos)
+	n := 0
+	for dx := -2; dx <= 2; dx++ {
+		for dy := -2; dy <= 2; dy++ {
+			for dz := -2; dz <= 2; dz++ {
+				nk := [3]int{k[0] + dx, k[1] + dy, k[2] + dz}
+				for _, i := range g.cells[nk] {
+					d := pos.Sub(g.atoms[i].pos).Norm()
+					if d >= minD && d <= maxD {
+						n++
+					}
+				}
+			}
+		}
+	}
+	return n
 }

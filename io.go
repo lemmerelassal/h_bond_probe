@@ -10,9 +10,10 @@ import (
 	"strings"
 )
 
-// LoadAtoms reads atoms from a local PDB/mmCIF file or downloads from RCSB.
-// Returns the atom slice, the uppercase PDB ID (for output naming), and any error.
-func LoadAtoms(arg string) ([]Atom, string, error) {
+// LoadAtoms reads atoms from a local PDB/mmCIF file, downloads from RCSB,
+// or downloads from AlphaFold DB (when alphafold=true).
+// Returns the atom slice, the uppercase ID (for output naming), and any error.
+func LoadAtoms(arg string, alphafold bool) ([]Atom, string, error) {
 	if _, err := os.Stat(arg); err == nil {
 		data, e := os.ReadFile(arg)
 		if e != nil {
@@ -40,6 +41,35 @@ func LoadAtoms(arg string) ([]Atom, string, error) {
 	}
 
 	id := strings.ToUpper(strings.TrimSpace(arg))
+
+	if alphafold {
+		// AlphaFold DB: try recent model versions, because some entries only
+		// expose newer versions such as model_v6.
+		for _, version := range []int{6, 5, 4, 3} {
+			url := fmt.Sprintf("https://alphafold.ebi.ac.uk/files/AF-%s-F1-model_v%d.cif", id, version)
+			fmt.Printf("Fetching AlphaFold structure: %s\n", url)
+			resp, err := http.Get(url) //nolint:noctx
+			if err != nil {
+				if resp != nil {
+					resp.Body.Close()
+				}
+				continue
+			}
+			if resp.StatusCode != 200 {
+				resp.Body.Close()
+				continue
+			}
+			data, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			atoms, _ := parseCIF(string(data))
+			if len(atoms) > 0 {
+				fmt.Printf("Parsed %d atoms from AlphaFold.\n", len(atoms))
+				return atoms, "AF_" + id, nil
+			}
+		}
+		return nil, "", fmt.Errorf("could not fetch AlphaFold structure for: %s", id)
+	}
+
 	for _, ext := range []string{"pdb", "cif"} {
 		url := fmt.Sprintf("https://files.rcsb.org/download/%s.%s", id, ext)
 		fmt.Printf("Trying %s\n", url)

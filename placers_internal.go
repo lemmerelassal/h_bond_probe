@@ -1,20 +1,46 @@
 package main
 
 import (
+	"fmt"
 	"math"
+	"runtime"
+	"sort"
 	"strings"
+	"sync"
 )
 
-// methylCap appends a methyl C (sp3, bondCount=1) bonded to the atom at
-// anchorIdx (1-based), placed 1.47 Å away from anchor in the direction
-// opposite to awayFrom.  This gives linkProbeGroups a valid tail atom.
+// methylCap appends a methyl C bonded to anchorIdx, placed at the correct
+// hybridization angle from the existing bond (awayFrom→anchor).
+// For sp2 anchors (amide N, imine N): 120° angle in the plane defined by
+// inPlane (a third atom in the same plane, e.g. O or adjacent N).
+// For sp3 anchors: 109.5° tetrahedral angle, perpendicular to the plane.
+// If inPlane is zero, falls back to collinear (180°) placement.
 func methylCap(placedPos *[]Vec3, placedLabel *[]string, bonds *[]Bond,
-	anchorIdx int, anchor, awayFrom Vec3) {
-	dir := anchor.Sub(awayFrom)
-	if dir.Norm() < 1e-6 {
-		dir = Vec3{1, 0, 0}
+	anchorIdx int, anchor, awayFrom Vec3, inPlane ...Vec3) {
+	incoming := anchor.Sub(awayFrom) // direction of existing bond arriving at anchor
+	if incoming.Norm() < 1e-6 {
+		incoming = Vec3{1, 0, 0}
 	}
-	capPos := anchor.Add(dir.unit().Scale(1.47))
+	incoming = incoming.unit()
+
+	var capDir Vec3
+	if len(inPlane) > 0 && inPlane[0].Norm() > 1e-6 {
+		// sp2: place cap at 120° from the existing bond (awayFrom→anchor).
+		// At anchor, the existing bond arrives from awayFrom (direction: -incoming).
+		// Rotate -incoming by 120° in the molecular plane:
+		//   capDir = (-incoming)*cos(120°) + planeVec*sin(120°) = incoming*0.5 + planeVec*0.866
+		planeVec := inPlane[0].Sub(anchor)
+		planeVec = planeVec.Sub(incoming.Scale(planeVec.Dot(incoming)))
+		if planeVec.Norm() < 1e-6 {
+			planeVec = perpendicular(incoming)
+		}
+		planeVec = planeVec.unit()
+		capDir = incoming.Scale(0.5).Add(planeVec.Scale(0.866))
+	} else {
+		// Default: collinear extension (180°).
+		capDir = incoming
+	}
+	capPos := anchor.Add(capDir.unit().Scale(1.47))
 	capIdx := len(*placedPos) + 1
 	*placedPos = append(*placedPos, capPos)
 	*placedLabel = append(*placedLabel, "C")
@@ -22,20 +48,16 @@ func methylCap(placedPos *[]Vec3, placedLabel *[]string, bonds *[]Bond,
 }
 
 func placeArgAcids(atoms []Atom, placedPos *[]Vec3, placedLabel *[]string, bonds *[]Bond) int {
-	type resKey struct {
-		chain string
-		seq   int
-	}
 	type guanGroup struct {
 		NE, CZ, NH1, NH2 Vec3
 		found             [4]bool
 	}
-	groups := map[resKey]*guanGroup{}
+	groups := map[residueKey]*guanGroup{}
 	for _, a := range atoms {
 		if strings.TrimSpace(strings.ToUpper(a.ResName)) != "ARG" {
 			continue
 		}
-		key := resKey{a.ChainID, a.ResSeq}
+		key := residueKey{a.ChainID, a.ResSeq}
 		if groups[key] == nil {
 			groups[key] = &guanGroup{}
 		}
@@ -52,23 +74,12 @@ func placeArgAcids(atoms []Atom, placedPos *[]Vec3, placedLabel *[]string, bonds
 		}
 	}
 
-	// Collect all non-H atoms tagged with their residue for per-ARG exclusion.
-	type taggedHeavy struct {
-		pos          Vec3
-		vdwR         float64
-		chain        string
-		seq          int
-	}
-	var heavy []taggedHeavy
-	for _, a := range atoms {
-		if strings.ToUpper(a.Element) == "H" || isWater(a) {
-			continue
-		}
-		heavy = append(heavy, taggedHeavy{a.Pos, vdw(a.Element), a.ChainID, a.ResSeq})
-	}
+	// Tagged heavy atoms supporting per-ARG exclusion during clash checks.
+	clash := newResClashSet(atoms)
 
 	placed := 0
-	for key, g := range groups {
+	for _, key := range sortedResidueKeys(groups) {
+		g := groups[key]
 		if !g.found[0] || !g.found[1] || !g.found[2] || !g.found[3] {
 			continue
 		}
@@ -84,19 +95,6 @@ func placeArgAcids(atoms []Atom, placedPos *[]Vec3, placedLabel *[]string, bonds
 			yH := cross3(zHat, nh1Perp).unit()
 			return cross3(yH, zHat).unit()
 		}()
-
-		clears := func(pos Vec3, elem string) bool {
-			r := vdw(elem)
-			for _, h := range heavy {
-				if h.chain == key.chain && h.seq == key.seq {
-					continue
-				}
-				if pos.Sub(h.pos).Norm() < h.vdwR+r-hardTol {
-					return false
-				}
-			}
-			return true
-		}
 
 		buildAcid := func(xHat Vec3, theta float64) (Vec3, Vec3, Vec3, Vec3) {
 			cosT, sinT := math.Cos(theta), math.Sin(theta)
@@ -114,7 +112,7 @@ func placeArgAcids(atoms []Atom, placedPos *[]Vec3, placedLabel *[]string, bonds
 		for step := 0; step < 12 && !found; step++ {
 			theta := float64(step) * math.Pi / 6
 			c1, c2, o1, o2 := buildAcid(baseX, theta)
-			if clears(c1, "C") && clears(c2, "C") && clears(o1, "O") && clears(o2, "O") {
+			if clash.clears(c1, "C", key) && clash.clears(c2, "C", key) && clash.clears(o1, "O", key) && clash.clears(o2, "O", key) {
 				bc1, bc2, bo1, bo2 = c1, c2, o1, o2
 				found = true
 			}
@@ -151,22 +149,18 @@ func placeArgAcids(atoms []Atom, placedPos *[]Vec3, placedLabel *[]string, bonds
 // The first candidate that clears all clash checks is accepted.
 // Returns the number placed.
 func placeCarboxylateGuanidines(atoms []Atom, placedPos *[]Vec3, placedLabel *[]string, bonds *[]Bond) int {
-	type resKey struct {
-		chain string
-		seq   int
-	}
 	type carboxylGroup struct {
 		prevC, carboxylC, O1, O2 Vec3
 		found                    [4]bool
 	}
-	groups := map[resKey]*carboxylGroup{}
+	groups := map[residueKey]*carboxylGroup{}
 
 	for _, a := range atoms {
 		res := strings.TrimSpace(strings.ToUpper(a.ResName))
 		if res != "ASP" && res != "GLU" {
 			continue
 		}
-		key := resKey{a.ChainID, a.ResSeq}
+		key := residueKey{a.ChainID, a.ResSeq}
 		if groups[key] == nil {
 			groups[key] = &carboxylGroup{}
 		}
@@ -191,37 +185,13 @@ func placeCarboxylateGuanidines(atoms []Atom, placedPos *[]Vec3, placedLabel *[]
 		}
 	}
 
-	type taggedHeavy struct {
-		pos   Vec3
-		vdwR  float64
-		chain string
-		seq   int
-	}
-	var heavy []taggedHeavy
-	for _, a := range atoms {
-		if strings.ToUpper(a.Element) == "H" || isWater(a) {
-			continue
-		}
-		heavy = append(heavy, taggedHeavy{a.Pos, vdw(a.Element), a.ChainID, a.ResSeq})
-	}
+	clash := newResClashSet(atoms)
 
 	placed := 0
-	for key, g := range groups {
+	for _, key := range sortedResidueKeys(groups) {
+		g := groups[key]
 		if !g.found[0] || !g.found[1] || !g.found[2] || !g.found[3] {
 			continue
-		}
-
-		clears := func(pos Vec3, elem string) bool {
-			r := vdw(elem)
-			for _, h := range heavy {
-				if h.chain == key.chain && h.seq == key.seq {
-					continue
-				}
-				if pos.Sub(h.pos).Norm() < h.vdwR+r-hardTol {
-					return false
-				}
-			}
-			return true
 		}
 
 		// Base approach axis: prevC→carboxylC.
@@ -238,9 +208,12 @@ func placeCarboxylateGuanidines(atoms []Atom, placedPos *[]Vec3, placedLabel *[]
 			return cross3(yH, zHat).unit()
 		}
 
-		// buildGuanidine returns the four atom positions for a given zHat and xHat,
+		// buildGuanidine returns the five atom positions for a given zHat and xHat,
 		// rotated by angle θ around zHat.
-		buildGuanidine := func(zHat, xHat Vec3, theta float64) (Vec3, Vec3, Vec3, Vec3) {
+		// N3 is the imine N pointing away from the carboxylate; stemC is a carbon
+		// bonded to N3 that serves as the linker attachment point, preventing the
+		// linker from connecting to the H-bond-donor nitrogens N1/N2.
+		buildGuanidine := func(zHat, xHat Vec3, theta float64) (Vec3, Vec3, Vec3, Vec3, Vec3) {
 			cosT, sinT := math.Cos(theta), math.Sin(theta)
 			// Rotate xHat around zHat by theta.
 			yHat := cross3(zHat, xHat)
@@ -249,11 +222,12 @@ func placeCarboxylateGuanidines(atoms []Atom, placedPos *[]Vec3, placedLabel *[]
 			n1 := guanC.Add(rx.Scale(1.152)).Sub(zHat.Scale(0.665))
 			n2 := guanC.Sub(rx.Scale(1.152)).Sub(zHat.Scale(0.665))
 			n3 := guanC.Add(zHat.Scale(1.33))
-			return guanC, n1, n2, n3
+			stemC := n3.Add(zHat.Scale(1.47)) // C–N single bond, linker handle
+			return guanC, n1, n2, n3, stemC
 		}
 
 		found := false
-		var bestC, bestN1, bestN2, bestN3 Vec3
+		var bestC, bestN1, bestN2, bestN3, bestStemC Vec3
 		// Try both faces (±zHat) × 12 rotation steps (30°).
 		for _, sign := range []float64{1, -1} {
 			if found {
@@ -263,9 +237,9 @@ func placeCarboxylateGuanidines(atoms []Atom, placedPos *[]Vec3, placedLabel *[]
 			xHat := buildXHat(zHat)
 			for step := 0; step < 12; step++ {
 				theta := float64(step) * math.Pi / 6
-				guanC, n1, n2, n3 := buildGuanidine(zHat, xHat, theta)
-				if clears(guanC, "C") && clears(n1, "N") && clears(n2, "N") && clears(n3, "N") {
-					bestC, bestN1, bestN2, bestN3 = guanC, n1, n2, n3
+				guanC, n1, n2, n3, stemC := buildGuanidine(zHat, xHat, theta)
+				if clash.clears(guanC, "C", key) && clash.clears(n1, "N", key) && clash.clears(n2, "N", key) && clash.clears(n3, "N", key) && clash.clears(stemC, "C", key) {
+					bestC, bestN1, bestN2, bestN3, bestStemC = guanC, n1, n2, n3, stemC
 					found = true
 					break
 				}
@@ -276,21 +250,14 @@ func placeCarboxylateGuanidines(atoms []Atom, placedPos *[]Vec3, placedLabel *[]
 		}
 
 		base := len(*placedPos) + 1
-		*placedPos = append(*placedPos, bestC, bestN1, bestN2, bestN3)
-		*placedLabel = append(*placedLabel, "C", "N", "N", "N")
+		*placedPos = append(*placedPos, bestC, bestN1, bestN2, bestN3, bestStemC)
+		*placedLabel = append(*placedLabel, "C", "N", "N", "N", "C")
 		*bonds = append(*bonds,
 			Bond{base, base + 1, 1},     // C–N1 single
 			Bond{base, base + 2, 1},     // C–N2 single
 			Bond{base, base + 3, 2},     // C=N3 double (imine)
+			Bond{base + 3, base + 4, 1}, // N3–stemC single (linker handle)
 		)
-		// Methyl cap on N1: gives linkProbeGroups a valid sp3 C tail.
-		// N1 has bondCount=1 after the C–N1 bond, leaving 2 slots free;
-		// the methyl C (bondCount=1) becomes the tail.
-		methyl := bestN1.Add(bestC.Sub(bestN1).Scale(-1).unit().Scale(1.47))
-		methylIdx := len(*placedPos) + 1
-		*placedPos = append(*placedPos, methyl)
-		*placedLabel = append(*placedLabel, "C")
-		*bonds = append(*bonds, Bond{base + 1, methylIdx, 1}) // N1–CH3
 		placed++
 	}
 	return placed
@@ -309,21 +276,17 @@ func placeCarboxylateGuanidines(atoms []Atom, placedPos *[]Vec3, placedLabel *[]
 // Atom order appended: C1 (methyl), C2 (carbonyl C), O (carbonyl O), N (amide N).
 // Bonds: C1–C2 single, C2=O double, C2–N single.
 func placeTyrAcetamides(atoms []Atom, placedPos *[]Vec3, placedLabel *[]string, bonds *[]Bond) int {
-	type resKey struct {
-		chain string
-		seq   int
-	}
 	type tyrGroup struct {
 		CZ, OH, CE1 Vec3
 		found       [3]bool
 	}
-	groups := map[resKey]*tyrGroup{}
+	groups := map[residueKey]*tyrGroup{}
 
 	for _, a := range atoms {
 		if strings.TrimSpace(strings.ToUpper(a.ResName)) != "TYR" {
 			continue
 		}
-		key := resKey{a.ChainID, a.ResSeq}
+		key := residueKey{a.ChainID, a.ResSeq}
 		if groups[key] == nil {
 			groups[key] = &tyrGroup{}
 		}
@@ -338,22 +301,11 @@ func placeTyrAcetamides(atoms []Atom, placedPos *[]Vec3, placedLabel *[]string, 
 		}
 	}
 
-	type taggedHeavy struct {
-		pos   Vec3
-		vdwR  float64
-		chain string
-		seq   int
-	}
-	var heavy []taggedHeavy
-	for _, a := range atoms {
-		if strings.ToUpper(a.Element) == "H" || isWater(a) {
-			continue
-		}
-		heavy = append(heavy, taggedHeavy{a.Pos, vdw(a.Element), a.ChainID, a.ResSeq})
-	}
+	clash := newResClashSet(atoms)
 
 	placed := 0
-	for key, g := range groups {
+	for _, key := range sortedResidueKeys(groups) {
+		g := groups[key]
 		if !g.found[0] || !g.found[1] || !g.found[2] {
 			continue
 		}
@@ -370,19 +322,6 @@ func placeTyrAcetamides(atoms []Atom, placedPos *[]Vec3, placedLabel *[]string, 
 		// (cos/sin of 71° = 180°−109°).  The ± chooses which side of the ring the H is on.
 		// Carbonyl O placed at OH + dH·2.8 (O···O H-bond); C2 a further 1.24 Å along dH.
 		// N and C1 placed in the ring plane at 122° from C2→O; try all 4 orientations.
-
-		clears := func(pos Vec3, elem string) bool {
-			r := vdw(elem)
-			for _, h := range heavy {
-				if h.chain == key.chain && h.seq == key.seq {
-					continue
-				}
-				if pos.Sub(h.pos).Norm() < h.vdwR+r-hardTol {
-					return false
-				}
-			}
-			return true
-		}
 
 		type acPlacement struct{ O, C2, N, C1 Vec3 }
 		var candidates []acPlacement
@@ -403,7 +342,7 @@ func placeTyrAcetamides(atoms []Atom, placedPos *[]Vec3, placedLabel *[]string, 
 		var chosen acPlacement
 		placed2 := false
 		for _, c := range candidates {
-			if clears(c.O, "O") && clears(c.C2, "C") && clears(c.N, "N") && clears(c.C1, "C") {
+			if clash.clears(c.O, "O", key) && clash.clears(c.C2, "C", key) && clash.clears(c.N, "N", key) && clash.clears(c.C1, "C", key) {
 				chosen = c
 				placed2 = true
 				break
@@ -422,6 +361,8 @@ func placeTyrAcetamides(atoms []Atom, placedPos *[]Vec3, placedLabel *[]string, 
 			Bond{base + 1, base + 2, 2}, // C2=O  double
 			Bond{base + 1, base + 3, 1}, // C2–N  single
 		)
+		// C1 is the methyl carbon (sp3, bondCount=1) — it is already the natural
+		// linker tail without any additional cap.  No N cap needed.
 		placed++
 	}
 	return placed
@@ -440,10 +381,6 @@ func placeTyrAcetamides(atoms []Atom, placedPos *[]Vec3, placedLabel *[]string, 
 // Atom order: C0–C5 (ring, C0 = para-C bearing OH), O (para-OH).
 // Bonds: C0–C1…C5–C0 aromatic (order 4), C0–O single.
 func placeTyrPhenols(atoms []Atom, placedPos *[]Vec3, placedLabel *[]string, bonds *[]Bond) int {
-	type resKey struct {
-		chain string
-		seq   int
-	}
 	type tyrGroup struct {
 		ring  [6]Vec3 // CG, CD1, CD2, CE1, CE2, CZ
 		CZ    Vec3
@@ -453,13 +390,13 @@ func placeTyrPhenols(atoms []Atom, placedPos *[]Vec3, placedLabel *[]string, bon
 	ringSlot := map[string]int{
 		"CG": 0, "CD1": 1, "CD2": 2, "CE1": 3, "CE2": 4, "CZ": 5,
 	}
-	groups := map[resKey]*tyrGroup{}
+	groups := map[residueKey]*tyrGroup{}
 
 	for _, a := range atoms {
 		if strings.TrimSpace(strings.ToUpper(a.ResName)) != "TYR" {
 			continue
 		}
-		key := resKey{a.ChainID, a.ResSeq}
+		key := residueKey{a.ChainID, a.ResSeq}
 		if groups[key] == nil {
 			groups[key] = &tyrGroup{}
 		}
@@ -474,35 +411,11 @@ func placeTyrPhenols(atoms []Atom, placedPos *[]Vec3, placedLabel *[]string, bon
 		}
 	}
 
-	type taggedHeavy struct {
-		pos   Vec3
-		vdwR  float64
-		chain string
-		seq   int
-	}
-	var heavy []taggedHeavy
-	for _, a := range atoms {
-		if strings.ToUpper(a.Element) == "H" || isWater(a) {
-			continue
-		}
-		heavy = append(heavy, taggedHeavy{a.Pos, vdw(a.Element), a.ChainID, a.ResSeq})
-	}
-
-	clears := func(key resKey, pos Vec3, elem string) bool {
-		r := vdw(elem)
-		for _, h := range heavy {
-			if h.chain == key.chain && h.seq == key.seq {
-				continue
-			}
-			if pos.Sub(h.pos).Norm() < h.vdwR+r-hardTol {
-				return false
-			}
-		}
-		return true
-	}
+	clash := newResClashSet(atoms)
 
 	placed := 0
-	for key, g := range groups {
+	for _, key := range sortedResidueKeys(groups) {
+		g := groups[key]
 		// Require all 6 ring atoms.
 		allFound := true
 		for i := 0; i < 6; i++ {
@@ -543,7 +456,7 @@ func placeTyrPhenols(atoms []Atom, placedPos *[]Vec3, placedLabel *[]string, bon
 			phenolOH := phenolCenter.Add(dPara.Scale(1.40 + 1.36))
 
 			// Centre + OH check only (same policy as the π-stacking probe code).
-			if !clears(key, phenolCenter, "C") || !clears(key, phenolOH, "O") {
+			if !clash.clears(phenolCenter, "C", key) || !clash.clears(phenolOH, "O", key) {
 				continue
 			}
 
@@ -559,10 +472,14 @@ func placeTyrPhenols(atoms []Atom, placedPos *[]Vec3, placedLabel *[]string, bon
 			}
 			*bonds = append(*bonds, Bond{base, base + 6, 1}) // C0–O
 
-			// Methyl cap on the ring C opposite the OH (C3, index 3 from base).
-			// Direction: away from OH, so the cap points outward into solvent.
-			methylCap(placedPos, placedLabel, bonds,
-				base+3, ringPts[3], phenolOH)
+			// Methyl cap on ring C3 (para to OH): radial outward from probe ring centre.
+			// Ring C is sp2 with 2 ring bonds already; the cap goes straight radially.
+			capDir3 := ringPts[3].Sub(phenolCenter).unit()
+			capPos3 := ringPts[3].Add(capDir3.Scale(1.54))
+			capIdx3 := len(*placedPos) + 1
+			*placedPos = append(*placedPos, capPos3)
+			*placedLabel = append(*placedLabel, "C")
+			*bonds = append(*bonds, Bond{base + 3, capIdx3, 1})
 
 			placed++
 			break
@@ -586,22 +503,18 @@ func placeTyrPhenols(atoms []Atom, placedPos *[]Vec3, placedLabel *[]string, bon
 // Atom order: probeC, probeO, probeN1 (toward ND2), probeN2 (imine, toward OD1).
 // Bonds: probeC=probeO double, probeC–probeN1 single, probeC–probeN2 single.
 func placeAsnGlnAcetamides(atoms []Atom, placedPos *[]Vec3, placedLabel *[]string, bonds *[]Bond) int {
-	type resKey struct {
-		chain string
-		seq   int
-	}
 	type amideGroup struct {
 		prevC, amideC, O, N Vec3
 		found               [4]bool
 	}
-	groups := map[resKey]*amideGroup{}
+	groups := map[residueKey]*amideGroup{}
 
 	for _, a := range atoms {
 		res := strings.TrimSpace(strings.ToUpper(a.ResName))
 		if res != "ASN" && res != "GLN" {
 			continue
 		}
-		key := resKey{a.ChainID, a.ResSeq}
+		key := residueKey{a.ChainID, a.ResSeq}
 		if groups[key] == nil {
 			groups[key] = &amideGroup{}
 		}
@@ -627,22 +540,11 @@ func placeAsnGlnAcetamides(atoms []Atom, placedPos *[]Vec3, placedLabel *[]strin
 		}
 	}
 
-	type taggedHeavy struct {
-		pos   Vec3
-		vdwR  float64
-		chain string
-		seq   int
-	}
-	var heavy []taggedHeavy
-	for _, a := range atoms {
-		if strings.ToUpper(a.Element) == "H" || isWater(a) {
-			continue
-		}
-		heavy = append(heavy, taggedHeavy{a.Pos, vdw(a.Element), a.ChainID, a.ResSeq})
-	}
+	clash := newResClashSet(atoms)
 
 	placed := 0
-	for key, g := range groups {
+	for _, key := range sortedResidueKeys(groups) {
+		g := groups[key]
 		if !g.found[0] || !g.found[1] || !g.found[2] || !g.found[3] {
 			continue
 		}
@@ -671,19 +573,6 @@ func placeAsnGlnAcetamides(atoms []Atom, placedPos *[]Vec3, placedLabel *[]strin
 			return probeC, probeO, probeN1, probeN2
 		}
 
-		clears := func(pos Vec3, elem string) bool {
-			r := vdw(elem)
-			for _, h := range heavy {
-				if h.chain == key.chain && h.seq == key.seq {
-					continue
-				}
-				if pos.Sub(h.pos).Norm() < h.vdwR+r-hardTol {
-					return false
-				}
-			}
-			return true
-		}
-
 		found := false
 		var bpC, bpO, bpN1, bpN2 Vec3
 		for _, sign := range []float64{1, -1} {
@@ -695,7 +584,7 @@ func placeAsnGlnAcetamides(atoms []Atom, placedPos *[]Vec3, placedLabel *[]strin
 			for step := 0; step < 12 && !found; step++ {
 				theta := float64(step) * math.Pi / 6
 				pC, pO, pN1, pN2 := buildAmide(zHat, xHat, theta)
-				if clears(pC, "C") && clears(pO, "O") && clears(pN1, "N") && clears(pN2, "N") {
+				if clash.clears(pC, "C", key) && clash.clears(pO, "O", key) && clash.clears(pN1, "N", key) && clash.clears(pN2, "N", key) {
 					bpC, bpO, bpN1, bpN2 = pC, pO, pN1, pN2
 					found = true
 				}
@@ -713,8 +602,9 @@ func placeAsnGlnAcetamides(atoms []Atom, placedPos *[]Vec3, placedLabel *[]strin
 			Bond{base, base + 2, 1}, // C–N1 single (amide N toward residue N)
 			Bond{base, base + 3, 1}, // C–N2 single (amino N, away)
 		)
-		// Methyl cap on N2 (the outward-facing amino N), pointing away from C.
-		methylCap(placedPos, placedLabel, bonds, base+3, bpN2, bpC)
+		// Methyl caps on both N1 and N2 so linkProbeGroups picks the shortest path.
+		methylCap(placedPos, placedLabel, bonds, base+2, bpN1, bpC, bpN2) // N1–CH3
+		methylCap(placedPos, placedLabel, bonds, base+3, bpN2, bpC, bpN1) // N2–CH3 (was sp2 120°)
 		placed++
 	}
 	return placed
@@ -729,22 +619,18 @@ func placeAsnGlnAcetamides(atoms []Atom, placedPos *[]Vec3, placedLabel *[]strin
 // CB→OG axis (linear H-bond geometry). The probe methyl C is 1.43 Å further
 // along the same axis (C–O bond length). Returns the number placed.
 func placeSerThrMethanols(atoms []Atom, placedPos *[]Vec3, placedLabel *[]string, bonds *[]Bond) int {
-	type resKey struct {
-		chain string
-		seq   int
-	}
 	type hydroxyl struct {
 		CB, OG Vec3
 		found  [2]bool
 	}
-	groups := map[resKey]*hydroxyl{}
+	groups := map[residueKey]*hydroxyl{}
 
 	for _, a := range atoms {
 		res := strings.TrimSpace(strings.ToUpper(a.ResName))
 		if res != "SER" && res != "THR" {
 			continue
 		}
-		key := resKey{a.ChainID, a.ResSeq}
+		key := residueKey{a.ChainID, a.ResSeq}
 		if groups[key] == nil {
 			groups[key] = &hydroxyl{}
 		}
@@ -758,22 +644,11 @@ func placeSerThrMethanols(atoms []Atom, placedPos *[]Vec3, placedLabel *[]string
 		}
 	}
 
-	type taggedHeavy struct {
-		pos   Vec3
-		vdwR  float64
-		chain string
-		seq   int
-	}
-	var heavy []taggedHeavy
-	for _, a := range atoms {
-		if strings.ToUpper(a.Element) == "H" || isWater(a) {
-			continue
-		}
-		heavy = append(heavy, taggedHeavy{a.Pos, vdw(a.Element), a.ChainID, a.ResSeq})
-	}
+	clash := newResClashSet(atoms)
 
 	placed := 0
-	for key, g := range groups {
+	for _, key := range sortedResidueKeys(groups) {
+		g := groups[key]
 		if !g.found[0] || !g.found[1] {
 			continue
 		}
@@ -782,25 +657,12 @@ func placeSerThrMethanols(atoms []Atom, placedPos *[]Vec3, placedLabel *[]string
 		// Try both ±zHat: +zHat captures H-bond donors to the OH, −zHat captures acceptors.
 		baseZ := g.OG.Sub(g.CB).unit()
 
-		clears := func(pos Vec3, elem string) bool {
-			r := vdw(elem)
-			for _, h := range heavy {
-				if h.chain == key.chain && h.seq == key.seq {
-					continue
-				}
-				if pos.Sub(h.pos).Norm() < h.vdwR+r-hardTol {
-					return false
-				}
-			}
-			return true
-		}
-
 		placed2 := false
 		for _, sign := range []float64{1, -1} {
 			zHat := baseZ.Scale(sign)
 			probeO := g.OG.Add(zHat.Scale(2.80))
 			probeC := g.OG.Add(zHat.Scale(2.80 + 1.43))
-			if clears(probeO, "O") && clears(probeC, "C") {
+			if clash.clears(probeO, "O", key) && clash.clears(probeC, "C", key) {
 				base := len(*placedPos) + 1
 				*placedPos = append(*placedPos, probeO, probeC)
 				*placedLabel = append(*placedLabel, "O", "C")
@@ -825,21 +687,17 @@ func placeSerThrMethanols(atoms []Atom, placedPos *[]Vec3, placedLabel *[]string
 // O1/O2 sit at ±1.10 Å perpendicular and 0.59 Å further, giving N···O ≈ 2.9 Å.
 // Methyl C1 is 1.52 Å beyond C2. Returns the number placed.
 func placeLysAcetates(atoms []Atom, placedPos *[]Vec3, placedLabel *[]string, bonds *[]Bond) int {
-	type resKey struct {
-		chain string
-		seq   int
-	}
 	type lys struct {
 		CE, NZ Vec3
 		found  [2]bool
 	}
-	groups := map[resKey]*lys{}
+	groups := map[residueKey]*lys{}
 
 	for _, a := range atoms {
 		if strings.TrimSpace(strings.ToUpper(a.ResName)) != "LYS" {
 			continue
 		}
-		key := resKey{a.ChainID, a.ResSeq}
+		key := residueKey{a.ChainID, a.ResSeq}
 		if groups[key] == nil {
 			groups[key] = &lys{}
 		}
@@ -852,22 +710,11 @@ func placeLysAcetates(atoms []Atom, placedPos *[]Vec3, placedLabel *[]string, bo
 		}
 	}
 
-	type taggedHeavy struct {
-		pos   Vec3
-		vdwR  float64
-		chain string
-		seq   int
-	}
-	var heavy []taggedHeavy
-	for _, a := range atoms {
-		if strings.ToUpper(a.Element) == "H" || isWater(a) {
-			continue
-		}
-		heavy = append(heavy, taggedHeavy{a.Pos, vdw(a.Element), a.ChainID, a.ResSeq})
-	}
+	clash := newResClashSet(atoms)
 
 	placed := 0
-	for key, g := range groups {
+	for _, key := range sortedResidueKeys(groups) {
+		g := groups[key]
 		if !g.found[0] || !g.found[1] {
 			continue
 		}
@@ -886,25 +733,12 @@ func placeLysAcetates(atoms []Atom, placedPos *[]Vec3, placedLabel *[]string, bo
 			return c1, c2, o1, o2
 		}
 
-		clears := func(pos Vec3, elem string) bool {
-			r := vdw(elem)
-			for _, h := range heavy {
-				if h.chain == key.chain && h.seq == key.seq {
-					continue
-				}
-				if pos.Sub(h.pos).Norm() < h.vdwR+r-hardTol {
-					return false
-				}
-			}
-			return true
-		}
-
 		found := false
 		var bc1, bc2, bo1, bo2 Vec3
 		for step := 0; step < 12 && !found; step++ {
 			theta := float64(step) * math.Pi / 6
 			c1, c2, o1, o2 := buildAcetate(baseX, theta)
-			if clears(c1, "C") && clears(c2, "C") && clears(o1, "O") && clears(o2, "O") {
+			if clash.clears(c1, "C", key) && clash.clears(c2, "C", key) && clash.clears(o1, "O", key) && clash.clears(o2, "O", key) {
 				bc1, bc2, bo1, bo2 = c1, c2, o1, o2
 				found = true
 			}
@@ -934,21 +768,17 @@ func placeLysAcetates(atoms []Atom, placedPos *[]Vec3, placedLabel *[]string, bo
 // (S···S or S···N distance at outer H-bond range). Probe C is 1.82 Å further.
 // Returns the number placed.
 func placeCysMethanethiols(atoms []Atom, placedPos *[]Vec3, placedLabel *[]string, bonds *[]Bond) int {
-	type resKey struct {
-		chain string
-		seq   int
-	}
 	type thiol struct {
 		CB, SG Vec3
 		found  [2]bool
 	}
-	groups := map[resKey]*thiol{}
+	groups := map[residueKey]*thiol{}
 
 	for _, a := range atoms {
 		if strings.TrimSpace(strings.ToUpper(a.ResName)) != "CYS" {
 			continue
 		}
-		key := resKey{a.ChainID, a.ResSeq}
+		key := residueKey{a.ChainID, a.ResSeq}
 		if groups[key] == nil {
 			groups[key] = &thiol{}
 		}
@@ -961,47 +791,23 @@ func placeCysMethanethiols(atoms []Atom, placedPos *[]Vec3, placedLabel *[]strin
 		}
 	}
 
-	type taggedHeavy struct {
-		pos   Vec3
-		vdwR  float64
-		chain string
-		seq   int
-	}
-	var heavy []taggedHeavy
-	for _, a := range atoms {
-		if strings.ToUpper(a.Element) == "H" || isWater(a) {
-			continue
-		}
-		heavy = append(heavy, taggedHeavy{a.Pos, vdw(a.Element), a.ChainID, a.ResSeq})
-	}
+	clash := newResClashSet(atoms)
 
 	placed := 0
-	for key, g := range groups {
+	for _, key := range sortedResidueKeys(groups) {
+		g := groups[key]
 		if !g.found[0] || !g.found[1] {
 			continue
 		}
 
 		baseZ := g.SG.Sub(g.CB).unit()
 
-		clears := func(pos Vec3, elem string) bool {
-			r := vdw(elem)
-			for _, h := range heavy {
-				if h.chain == key.chain && h.seq == key.seq {
-					continue
-				}
-				if pos.Sub(h.pos).Norm() < h.vdwR+r-hardTol {
-					return false
-				}
-			}
-			return true
-		}
-
 		placed2 := false
 		for _, sign := range []float64{1, -1} {
 			zHat := baseZ.Scale(sign)
 			probeS := g.SG.Add(zHat.Scale(3.60))
 			probeC := g.SG.Add(zHat.Scale(3.60 + 1.82))
-			if clears(probeS, "S") && clears(probeC, "C") {
+			if clash.clears(probeS, "S", key) && clash.clears(probeC, "C", key) {
 				base := len(*placedPos) + 1
 				*placedPos = append(*placedPos, probeS, probeC)
 				*placedLabel = append(*placedLabel, "S", "C")
@@ -1027,10 +833,6 @@ func placeCysMethanethiols(atoms []Atom, placedPos *[]Vec3, placedLabel *[]strin
 // (π-stacking distance), analogous to placeTyrPhenols. Both faces are tried;
 // the one with fewer clashes is accepted. Returns the number placed.
 func placeHisImidazoles(atoms []Atom, placedPos *[]Vec3, placedLabel *[]string, bonds *[]Bond) int {
-	type resKey struct {
-		chain string
-		seq   int
-	}
 	type hisGroup struct {
 		ring  [5]Vec3 // CG, ND1, CD2, CE1, NE2
 		found [5]bool
@@ -1038,13 +840,13 @@ func placeHisImidazoles(atoms []Atom, placedPos *[]Vec3, placedLabel *[]string, 
 	ringSlot := map[string]int{
 		"CG": 0, "ND1": 1, "CD2": 2, "CE1": 3, "NE2": 4,
 	}
-	groups := map[resKey]*hisGroup{}
+	groups := map[residueKey]*hisGroup{}
 
 	for _, a := range atoms {
 		if strings.TrimSpace(strings.ToUpper(a.ResName)) != "HIS" {
 			continue
 		}
-		key := resKey{a.ChainID, a.ResSeq}
+		key := residueKey{a.ChainID, a.ResSeq}
 		if groups[key] == nil {
 			groups[key] = &hisGroup{}
 		}
@@ -1056,35 +858,11 @@ func placeHisImidazoles(atoms []Atom, placedPos *[]Vec3, placedLabel *[]string, 
 		}
 	}
 
-	type taggedHeavy struct {
-		pos   Vec3
-		vdwR  float64
-		chain string
-		seq   int
-	}
-	var heavy []taggedHeavy
-	for _, a := range atoms {
-		if strings.ToUpper(a.Element) == "H" || isWater(a) {
-			continue
-		}
-		heavy = append(heavy, taggedHeavy{a.Pos, vdw(a.Element), a.ChainID, a.ResSeq})
-	}
-
-	clears := func(key resKey, pos Vec3, elem string) bool {
-		r := vdw(elem)
-		for _, h := range heavy {
-			if h.chain == key.chain && h.seq == key.seq {
-				continue
-			}
-			if pos.Sub(h.pos).Norm() < h.vdwR+r-hardTol {
-				return false
-			}
-		}
-		return true
-	}
+	clash := newResClashSet(atoms)
 
 	placed := 0
-	for key, g := range groups {
+	for _, key := range sortedResidueKeys(groups) {
+		g := groups[key]
 		allFound := true
 		for i := 0; i < 5; i++ {
 			if !g.found[i] {
@@ -1115,7 +893,7 @@ func placeHisImidazoles(atoms []Atom, placedPos *[]Vec3, placedLabel *[]string, 
 
 		for _, sign := range []float64{1, -1} {
 			centre := centroid.Add(ringNormal.Scale(sign * 3.5))
-			if !clears(key, centre, "C") {
+			if !clash.clears(centre, "C", key) {
 				continue
 			}
 
@@ -1136,8 +914,13 @@ func placeHisImidazoles(atoms []Atom, placedPos *[]Vec3, placedLabel *[]string, 
 			for i := 0; i < 5; i++ {
 				*bonds = append(*bonds, Bond{base + i, base + (i+1)%5, 4})
 			}
-			// Methyl cap on C4 (atom index 3, a ring C), pointing away from ring centre.
-			methylCap(placedPos, placedLabel, bonds, base+3, ringPts[3], centre)
+			// Methyl cap on C4: radial outward from ring centre (correct for sp2 ring C).
+			capDir4 := ringPts[3].Sub(centre).unit()
+			capPos4 := ringPts[3].Add(capDir4.Scale(1.54))
+			capIdx4 := len(*placedPos) + 1
+			*placedPos = append(*placedPos, capPos4)
+			*placedLabel = append(*placedLabel, "C")
+			*bonds = append(*bonds, Bond{base + 3, capIdx4, 1})
 			placed++
 			break
 		}
@@ -1238,20 +1021,104 @@ func placeWaterMethanols(atoms []Atom, placedPos *[]Vec3, placedLabel *[]string,
 }
 
 
-// linkProbeGroups connects distinct probe components with straight carbon-chain
-// linkers.  For each component the best tail atom is chosen — preferring C,
-// then fewest bonds, then furthest from any polar atom in the same component.
-// Only atoms with 0-based index < linkableN are eligible as tail candidates;
-// pharmacophoric probes placed after the hydrophobic/aromatic pass are passed
-// in the full slice so the BFS sees them, but they are never picked as linker
-// attachment points and never merged into a larger fragment.
-// Pairs of tail atoms within maxDist are linked in
-// minimum-spanning-tree order (closest first, Union-Find to avoid cycles).
-// Chain atoms are spaced at 1.54 Å intervals along the straight line; any
-// candidate chain atom that clashes with a protein heavy atom is rejected.
-// Returns the number of chains added.
+// linkProbeGroups connects pairs of nearby probe components with sp3 alkane
+// linkers.  Each pair becomes a completely independent ProbeSet containing
+// copies of both probe atom sets plus the linker chain — so probes can appear
+// in multiple output molecules without sharing atom indices.
+// Returns one ProbeSet per linked pair.
+// buildChainPath finds a clash-free sp3 carbon chain from start to end using
+// beam search. startIncoming is the unit vector of the bond arriving AT start
+// (direction from start's predecessor toward start). Returns intermediate atom
+// positions between start and end (exclusive), or nil if no path is found.
+func buildChainPath(start, end Vec3, startIncoming Vec3, maxAtoms int, grid *clashGrid) []Vec3 {
+	const (
+		bondLen   = 1.54
+		cosT      = -0.333 // cos(109.5°)
+		sinT      = 0.9428
+		beamWidth = 16
+		nRot      = 12 // rotation steps around tetrahedral cone
+		minBond   = 1.30
+		maxBond   = 1.65
+	)
+
+	cfp := func(pos Vec3, chain []Vec3) bool {
+		if !grid.clashFree(pos, vdw("C"), hardTol) {
+			return false
+		}
+		r := vdw("C")
+		for _, ep := range chain {
+			if pos.Sub(ep).Norm() < r+r-1.0 {
+				return false
+			}
+		}
+		return true
+	}
+
+	type node struct {
+		chain []Vec3 // atoms placed so far, chain[0] = start
+		dir   Vec3   // incoming bond direction at chain[last]
+		dist  float64
+	}
+
+	beam := []node{{
+		chain: []Vec3{start},
+		dir:   startIncoming,
+		dist:  start.Sub(end).Norm(),
+	}}
+
+	for depth := 0; depth < maxAtoms; depth++ {
+		var next []node
+		for _, cur := range beam {
+			pos := cur.chain[len(cur.chain)-1]
+			basePerp := perpendicular(cur.dir)
+			perp2 := cross3(cur.dir, basePerp).unit()
+
+			for oi := 0; oi < nRot; oi++ {
+				ang := float64(oi) * 2 * math.Pi / float64(nRot)
+				p := basePerp.Scale(math.Cos(ang)).Add(perp2.Scale(math.Sin(ang)))
+				dir := cur.dir.Scale(cosT).Add(p.Scale(sinT)).unit()
+				np := pos.Add(dir.Scale(bondLen))
+
+				if !cfp(np, cur.chain) {
+					continue
+				}
+				d := np.Sub(end).Norm()
+				if d < minBond {
+					continue // overshot
+				}
+				if d <= maxBond {
+					// Reached end — return intermediates (exclude start).
+					result := make([]Vec3, len(cur.chain)-1+1)
+					copy(result, cur.chain[1:])
+					result[len(result)-1] = np
+					return result
+				}
+				// Prune nodes that can't possibly reach end in remaining steps.
+				remaining := maxAtoms - depth - 1
+				if d > float64(remaining)*bondLen*1.3+maxBond {
+					continue
+				}
+				nc := make([]Vec3, len(cur.chain)+1)
+				copy(nc, cur.chain)
+				nc[len(cur.chain)] = np
+				next = append(next, node{chain: nc, dir: dir, dist: d})
+			}
+		}
+		if len(next) == 0 {
+			return nil
+		}
+		sort.Slice(next, func(i, j int) bool { return next[i].dist < next[j].dist })
+		if len(next) > beamWidth {
+			next = next[:beamWidth]
+		}
+		beam = next
+	}
+	return nil
+}
+
 func linkProbeGroups(placedPos *[]Vec3, placedLabel *[]string, bonds *[]Bond,
-	proteinHeavy []heavyAtom, maxDist float64, linkableN int) int {
+	proteinHeavy []heavyAtom, maxDist float64, linkableN int) []ProbeSet {
+	grid := newClashGrid(proteinHeavy)
 
 	positions := *placedPos
 	labels := *placedLabel
@@ -1288,228 +1155,264 @@ func linkProbeGroups(placedPos *[]Vec3, placedLabel *[]string, bonds *[]Bond,
 		nComp++
 	}
 
-	// ── Per-atom valence count (to enforce element valence limits) ───────────
-	// Use bond order as the valence weight; aromatic bonds (order 4) count as 1.
-	valenceOf := func(order int) int {
-		if order == 4 {
-			return 1
-		}
-		return order
-	}
-	bondCount := make([]int, len(positions))
-	for _, b := range *bonds {
-		w := valenceOf(b.Order)
-		bondCount[b.I-1] += w
-		bondCount[b.J-1] += w
-	}
-
-	// ── Tail atom per component ──────────────────────────────────────────────
-	// Tail = atom with available valence; prefer C over heteroatom, then
-	// fewest bonds, then maximum clearance from the nearest protein heavy atom
-	// (so the ghost methyl beats the probe C: the chain grows into solvent).
-	maxValence := func(lbl string) int {
-		switch strings.ToUpper(lbl) {
-		case "N":
-			return 3
-		case "O", "S":
-			return 2
-		default:
-			return 4
-		}
-	}
-	// Minimum distance from atom idx to any protein heavy atom.
-	proteinClearance := func(idx int) float64 {
-		best := 999.0
-		for _, h := range proteinHeavy {
-			if d := positions[idx].Sub(h.pos).Norm(); d < best {
-				best = d
+	// ── Pre-qualify components: must have ≥3 atoms and contain a heteroatom or ring.
+	// This excludes alkane chain segments and isolated single atoms.
+	compOK := make([]bool, nComp)
+	{
+		compSize := make([]int, nComp)
+		compHet := make([]bool, nComp)
+		for i := 0; i < linkableN; i++ {
+			c := comp[i]
+			compSize[c]++
+			switch strings.ToUpper(labels[i]) {
+			case "N", "O", "S", "SE", "F", "CL", "BR":
+				compHet[c] = true
 			}
 		}
-		return best
-	}
-	tailIdx := make([]int, nComp)
-	for i := range tailIdx {
-		tailIdx[i] = -1
-	}
-	for i := 0; i < n; i++ {
-		if i >= linkableN {
-			continue
-		}
-		// Only sp3 carbon atoms may serve as linker tails.
-		// Heteroatoms (N, O, S), aromatic carbons (bond order 4), and
-		// sp2 carbons (any double bond, order 2) all produce wrong bond geometry.
-		if labels[i] != "C" {
-			continue
-		}
-		isSp3 := true
+		compRing := make([]bool, nComp)
 		for _, b := range *bonds {
-			if (b.I-1 == i || b.J-1 == i) && (b.Order == 4 || b.Order == 2) {
-				isSp3 = false
-				break
+			if b.I-1 < linkableN {
+				compRing[comp[b.I-1]] = compRing[comp[b.I-1]] || (b.Order == 4)
 			}
 		}
-		if !isSp3 {
-			continue
+		// Also detect non-aromatic rings via DFS per component.
+		cadj := make([][]int, n)
+		for _, b := range *bonds {
+			i, j := b.I-1, b.J-1
+			if i < linkableN && j < linkableN {
+				cadj[i] = append(cadj[i], j)
+				cadj[j] = append(cadj[j], i)
+			}
 		}
-		if bondCount[i] >= maxValence(labels[i]) {
-			continue
+		visited := make([]bool, n)
+		var dfs func(node, parent, c int) bool
+		dfs = func(node, parent, c int) bool {
+			visited[node] = true
+			for _, nb := range cadj[node] {
+				if comp[nb] != c {
+					continue
+				}
+				if nb == parent {
+					continue
+				}
+				if visited[nb] {
+					return true
+				}
+				if dfs(nb, node, c) {
+					return true
+				}
+			}
+			return false
 		}
-		c := comp[i]
-		t := tailIdx[c]
-		if t < 0 {
-			tailIdx[c] = i
-			continue
+		for i := 0; i < linkableN; i++ {
+			if !visited[i] && dfs(i, -1, comp[i]) {
+				compRing[comp[i]] = true
+			}
 		}
-		iIsC := labels[i] == "C"
-		tIsC := labels[t] == "C"
-		iClear := proteinClearance(i)
-		tClear := proteinClearance(t)
-		switch {
-		case iIsC && !tIsC:
-			tailIdx[c] = i
-		case !iIsC && tIsC:
-			// keep t
-		case bondCount[i] < bondCount[t]:
-			tailIdx[c] = i
-		case bondCount[i] == bondCount[t] && iClear > tClear:
-			// prefer the atom further from protein — ghost methyl beats probe C
-			tailIdx[c] = i
+		for c := 0; c < nComp; c++ {
+			compOK[c] = compSize[c] >= 3 && (compHet[c] || compRing[c])
 		}
 	}
 
-	// ── Build candidate pairs sorted by probe-C to probe-C distance ─────────
-	// Use the probe C (neighbour of the ghost methyl tail) as the reference
-	// position — this is the actual pocket surface atom and gives the true
-	// intra-pocket distance.
-	type cpair struct{ c1, c2 int; d float64 }
+	// ── Build candidate pairs: nearest atom between every qualifying component pair ──
+	// For each (c1, c2), find the atom pair (i ∈ c1, j ∈ c2) with the smallest
+	// distance. Any atom can be a connection point.
+	type cpair struct {
+		c1, c2 int
+		t1, t2 int     // nearest atoms (one per component)
+		d      float64
+	}
 	var pairs []cpair
-	// Build candidate pairs sorted by tail-atom-to-tail-atom distance.
 	for c1 := 0; c1 < nComp; c1++ {
-		if tailIdx[c1] < 0 {
+		if !compOK[c1] {
 			continue
 		}
 		for c2 := c1 + 1; c2 < nComp; c2++ {
-			if tailIdx[c2] < 0 {
+			if !compOK[c2] {
 				continue
 			}
-			d := positions[tailIdx[c1]].Sub(positions[tailIdx[c2]]).Norm()
-			if d >= 2.0 && d <= maxDist {
-				pairs = append(pairs, cpair{c1, c2, d})
+			bestD := math.MaxFloat64
+			bestI, bestJ := -1, -1
+			for i := 0; i < linkableN; i++ {
+				if comp[i] != c1 {
+					continue
+				}
+				for j := 0; j < linkableN; j++ {
+					if comp[j] != c2 {
+						continue
+					}
+					d := positions[i].Sub(positions[j]).Norm()
+					if d < bestD {
+						bestD = d
+						bestI, bestJ = i, j
+					}
+				}
+			}
+			if bestI >= 0 && bestD >= 2.0 && bestD <= maxDist {
+				pairs = append(pairs, cpair{c1, c2, bestI, bestJ, bestD})
 			}
 		}
 	}
-	for i := 1; i < len(pairs); i++ {
-		for j := i; j > 0 && pairs[j].d < pairs[j-1].d; j-- {
-			pairs[j], pairs[j-1] = pairs[j-1], pairs[j]
-		}
-	}
+	sort.Slice(pairs, func(i, j int) bool { return pairs[i].d < pairs[j].d })
 
-	// ── Union-Find (MST: closest pairs first, no cycles) ────────────────────
-	// compSize tracks how many original probe components have been merged into
-	// each super-component.  A merge is refused when it would push either
-	// super-component past maxGroupsPerMol original probes.
-	const maxGroupsPerMol = 3
-	parent := make([]int, nComp)
-	compSize := make([]int, nComp) // number of original components in this super-comp
-	tailUsed := make([]bool, nComp) // true once a component's tail has accepted a linker
-	for i := range parent {
-		parent[i] = i
-		compSize[i] = 1
+	// ── Connect nearest-neighbour pairs independently (parallel) ────────────
+	// Each pair of probe components becomes its own independent ProbeSet
+	// containing copies of both probe atom sets plus the linker chain.
+	// Probes can appear in multiple output molecules (reuse) as long as
+	// their tail atom has remaining valence.
+	//
+	// The per-pair body is embarrassingly parallel: all inputs (positions,
+	// labels, comp, adj, bonds, grid) are read-only after this point.
+	// Results are collected via a channel; bondCount is checked and updated
+	// serially after all goroutines finish.
+	type pairOut struct {
+		ps         ProbeSet
+		a1, a2     int
+		c1, c2     int
+		d          float64
 	}
-	var find func(int) int
-	find = func(x int) int {
-		if parent[x] != x {
-			parent[x] = find(parent[x])
-		}
-		return parent[x]
-	}
+	outCh := make(chan pairOut, len(pairs))
+	nCPU := runtime.NumCPU()
+	fmt.Printf("  linkProbeGroups: %d pairs, %d CPUs\n", len(pairs), nCPU)
+	sem := make(chan struct{}, nCPU)
+	var wg sync.WaitGroup
 
-	linked := 0
 	for _, p := range pairs {
-		r1, r2 := find(p.c1), find(p.c2)
-		if r1 == r2 {
-			continue // already in the same component
-		}
-		// Refuse if merging would exceed the per-molecule group limit.
-		if compSize[r1]+compSize[r2] > maxGroupsPerMol {
-			continue
-		}
-		// Each original component's tail may accept exactly one linker bond.
-		if tailUsed[p.c1] || tailUsed[p.c2] {
-			continue
-		}
-		a1, a2 := tailIdx[p.c1], tailIdx[p.c2]
+		p := p
+		sem <- struct{}{}
+		wg.Add(1)
+		go func() {
+			defer func() { <-sem; wg.Done() }()
 
-		// Refuse if either tail atom is already at valence limit.
-		if bondCount[a1]+1 > maxValence(labels[a1]) || bondCount[a2]+1 > maxValence(labels[a2]) {
-			continue
-		}
+			a1, a2 := p.t1, p.t2
 
-		// Build the chain directly between the two tail atoms (methyl caps).
-		// Each tail is an sp3 C pointing outward from its probe; connecting
-		// tail-to-tail keeps the linker in the space between probes.
-		pos1, pos2 := positions[a1], positions[a2]
+			pos1, pos2 := positions[a1], positions[a2]
 		chainDist := pos1.Sub(pos2).Norm()
 
 		// Build an all-trans sp3 zigzag chain between pos1 and pos2.
-		// Bond angle: 109.5° → forward pitch cosA=cos(35.25°)=0.8165, side sinA=0.578.
-		// We sample 12 perpendicular orientations (30° steps) and pick the one
-		// with the fewest clashes.  Clashing intermediate atoms are dropped from
-		// the placed set (bridged over with a longer bond) so the chain is always
-		// connected; we only reject the whole link if every orientation leaves
-		// every intermediate atom inside a protein atom.
 		axis := pos2.Sub(pos1).unit()
 
-		const (
-			bondLen = 1.54   // Å, standard C–C
-			cosA    = 0.8165 // cos(35.25°) — forward component per bond
-			sinA    = 0.578  // sin(35.25°) — perpendicular component per bond
-		)
-		nBase := int(math.Round(chainDist/1.258)) - 1
-		if nBase < 0 {
-			nBase = 0
+		// Compute the exit direction from pos1 toward the first chain atom.
+		// Geometry depends on hybridization of the connecting atom:
+		//   sp2 (2 heavy neighbors, any aromatic/double bond): exocyclic direction
+		//       = -normalize(sum of unit vectors to neighbors) — coplanar, 120°.
+		//   sp3 (1 heavy neighbor): tetrahedral cone at 109.5°, pick closest to axis.
+		//   no neighbors: straight along axis.
+		firstAtomDir := axis
+		nbs := adj[a1]
+		isSp2 := false
+		for _, b := range *bonds {
+			if (b.I-1 == a1 || b.J-1 == a1) && (b.Order == 2 || b.Order == 4) {
+				isSp2 = true
+				break
+			}
 		}
-		nInter := nBase
-		if nInter == 0 && chainDist > 1.60 {
-			nInter = 1
-		}
-
-		basePerp := func() Vec3 {
-			if len(adj[a1]) > 0 {
-				nb := adj[a1][0]
-				// Vector from the tail's predecessor to the tail (= existing bond direction).
-				// Project out the chain-axis component to get the in-plane offset.
-				// Negate so chain[0] is placed ANTI to this bond (180° junction torsion).
-				away := positions[a1].Sub(positions[nb])
-				away = away.Sub(axis.Scale(away.Dot(axis)))
-				if away.Norm() > 0.1 {
-					return away.Scale(-1).unit() // anti position
+		if len(nbs) >= 2 && isSp2 {
+			// sp2: exocyclic bond bisects the external angle of the two ring bonds.
+			sum := Vec3{}
+			for _, nb := range nbs {
+				sum = sum.Add(positions[nb].Sub(pos1).unit())
+			}
+			if sum.Norm() > 1e-6 {
+				firstAtomDir = sum.Scale(-1).unit()
+			}
+		} else if len(nbs) == 1 {
+			// sp3: 109.5° tetrahedral cone, pick direction closest to axis.
+			incoming := pos1.Sub(positions[nbs[0]]).unit()
+			baseP := perpendicular(incoming)
+			p2vec := cross3(incoming, baseP)
+			const cosT, sinT = -0.333, 0.9428
+			bestDot := -2.0
+			for oi := 0; oi < 12; oi++ {
+				ang := float64(oi) * math.Pi / 6
+				perp := baseP.Scale(math.Cos(ang)).Add(p2vec.Scale(math.Sin(ang)))
+				dir := incoming.Scale(cosT).Add(perp.Scale(sinT)).unit()
+				if dir.Dot(axis) > bestDot {
+					bestDot = dir.Dot(axis)
+					firstAtomDir = dir
 				}
 			}
-			return perpendicular(axis)
-		}()
-		perp2 := cross3(axis, basePerp).unit()
+		}
 
-		// Build a scaled 2D all-trans sp3 chain in the (axis, perp) plane.
-		// The 2D frame is rotated so the ideal chain endpoint maps exactly to
-		// pos2, giving perfect 180° torsions and ~109.5° bond angles as long as
-		// the scale factor s = d/idealLen is close to 1.
+		// Place the virtual first chain atom at the correct tetrahedral position.
+		// The chain is then built from this adjusted start toward pos2.
+		firstAtomPos := pos1.Add(firstAtomDir.Scale(1.54))
+
+		// Compute the symmetric exit direction into a2 (same sp2/sp3 logic as a1).
+		// lastAtomPos is a new chain atom placed one bond before pos2, so the
+		// chain ends at lastAtomPos and bonds pa2 at the correct sp2 angle.
+		lastAtomDir := axis.Scale(-1) // default: toward pos1
+		nbsA2 := adj[a2]
+		isSp2A2 := false
+		for _, b := range *bonds {
+			if (b.I-1 == a2 || b.J-1 == a2) && (b.Order == 2 || b.Order == 4) {
+				isSp2A2 = true
+				break
+			}
+		}
+		if len(nbsA2) >= 2 && isSp2A2 {
+			sum2 := Vec3{}
+			for _, nb := range nbsA2 {
+				sum2 = sum2.Add(positions[nb].Sub(pos2).unit())
+			}
+			if sum2.Norm() > 1e-6 {
+				lastAtomDir = sum2.Scale(-1).unit()
+			}
+		} else if len(nbsA2) == 1 {
+			incoming2 := pos2.Sub(positions[nbsA2[0]]).unit()
+			baseP2 := perpendicular(incoming2)
+			p2vec2 := cross3(incoming2, baseP2)
+			const cosT2, sinT2 = -0.333, 0.9428
+			bestDot2 := -2.0
+			for oi := 0; oi < 12; oi++ {
+				ang := float64(oi) * math.Pi / 6
+				perp2dir := baseP2.Scale(math.Cos(ang)).Add(p2vec2.Scale(math.Sin(ang)))
+				dir := incoming2.Scale(cosT2).Add(perp2dir.Scale(sinT2)).unit()
+				if dir.Dot(axis.Scale(-1)) > bestDot2 {
+					bestDot2 = dir.Dot(axis.Scale(-1))
+					lastAtomDir = dir
+				}
+			}
+		}
+		lastAtomPos := pos2.Add(lastAtomDir.Scale(1.54))
+
+		const (
+			bondLen = 1.54
+			cosA    = 0.8165
+			sinA    = 0.578
+		)
+		// Remaining distance from firstAtomPos to lastAtomPos (both end-caps excluded).
+		remDist := firstAtomPos.Sub(lastAtomPos).Norm()
+		nBase := int(math.Round(remDist/1.258)) - 1
+		if nBase < 0 { nBase = 0 }
+		nInter := nBase
+		if nInter == 0 && remDist > 1.60 { nInter = 1 }
+
+		remAxis := lastAtomPos.Sub(firstAtomPos).unit()
+
+		basePerp := func() Vec3 {
+			// Anti-periplanar to the firstAtomDir in the remAxis plane.
+			away := firstAtomDir.Sub(remAxis.Scale(firstAtomDir.Dot(remAxis)))
+			if away.Norm() > 0.1 { return away.Scale(-1).unit() }
+			return perpendicular(remAxis)
+		}()
+		perp2 := cross3(remAxis, basePerp).unit()
+
+		// Build the chain from firstAtomPos to lastAtomPos.
 		buildZigzag := func(n int, perpV Vec3) ([]Vec3, float64) {
 			if n == 0 {
-				return nil, pos1.Sub(pos2).Norm()
+				return nil, firstAtomPos.Sub(lastAtomPos).Norm()
 			}
 			type pt2 struct{ u, v float64 }
 			local := make([]pt2, n+2)
 			for k := 1; k <= n+1; k++ {
 				sign := 1.0
-				if (k-1)%2 == 1 {
-					sign = -1
-				}
+				if (k-1)%2 == 1 { sign = -1 }
 				local[k] = pt2{local[k-1].u + cosA*bondLen, local[k-1].v + sign*sinA*bondLen}
 			}
 			eu, ev := local[n+1].u, local[n+1].v
 			idealLen := math.Sqrt(eu*eu + ev*ev)
-			d := chainDist
+			d := remDist
 			s := d / idealLen
 			cosθ := eu / idealLen
 			sinθ := ev / idealLen
@@ -1518,10 +1421,10 @@ func linkProbeGroups(placedPos *[]Vec3, placedLabel *[]string, bonds *[]Bond,
 				u, v := local[k].u, local[k].v
 				ru := (u*cosθ + v*sinθ) * s
 				rv := (-u*sinθ + v*cosθ) * s
-				pts[k-1] = pos1.Add(axis.Scale(ru)).Add(perpV.Scale(rv))
+				pts[k-1] = firstAtomPos.Add(remAxis.Scale(ru)).Add(perpV.Scale(rv))
 			}
 			last := pts[n-1]
-			return pts, last.Sub(pos2).Norm()
+			return pts, last.Sub(lastAtomPos).Norm()
 		}
 
 		// estNInter returns the distance from the last chain atom to pos2.
@@ -1543,13 +1446,13 @@ func linkProbeGroups(placedPos *[]Vec3, placedLabel *[]string, bonds *[]Bond,
 			}
 			eu, ev := local[n+1].u, local[n+1].v
 			idealLen := math.Sqrt(eu*eu + ev*ev)
-			return chainDist / idealLen
+			return remDist / idealLen
 		}
 
-		// Pre-check and build: search nBase±3 × 12 orientations.
+		// Pre-check: search nBase±3 × 36 orientations, respecting the 6-carbon cap.
 		anyValid := false
 		for tryN := nInter - 3; tryN <= nInter+3 && !anyValid; tryN++ {
-			if tryN < 0 {
+			if tryN < 0 || tryN > 9 {
 				continue
 			}
 			s := sRatio(tryN)
@@ -1567,17 +1470,14 @@ func linkProbeGroups(placedPos *[]Vec3, placedLabel *[]string, bonds *[]Bond,
 			}
 		}
 		if !anyValid {
-			continue
+			return
 		}
 
 		clashPts := func(pts []Vec3) int {
 			n := 0
 			for _, pt := range pts {
-				for _, h := range proteinHeavy {
-					if pt.Sub(h.pos).Norm() < h.vdwR+vdw("C")-hardTol {
-						n++
-						break
-					}
+				if !grid.clashFree(pt, vdw("C"), hardTol) {
+					n++
 				}
 			}
 			return n
@@ -1629,14 +1529,27 @@ func linkProbeGroups(placedPos *[]Vec3, placedLabel *[]string, bonds *[]Bond,
 			return maxDev
 		}
 
+		// burialScore counts how many chain atoms have ≥4 protein neighbours
+		// within 6 Å — higher = more buried in pocket, better linker path.
+		burialScore := func(pts []Vec3) int {
+			score := 0
+			for _, pt := range pts {
+				if grid.countNearby(pt, 2.0, 6.0) >= 4 {
+					score++
+				}
+			}
+			return score
+		}
+
 		bestPts := []Vec3(nil)
 		bestClash := math.MaxInt32
 		bestFinalDev := math.MaxFloat64
 		bestTorDev := math.MaxFloat64
+		bestBurial := -1
 		bestNInter := nInter
 
 		for _, tryN := range []int{nInter - 3, nInter - 2, nInter - 1, nInter, nInter + 1, nInter + 2, nInter + 3} {
-			if tryN < 0 {
+			if tryN < 0 || tryN > 9 { // max 10 chain atoms (1 entry + 9 zigzag)
 				continue
 			}
 			// Skip if the scale factor would distort bond geometry too much.
@@ -1652,24 +1565,41 @@ func linkProbeGroups(placedPos *[]Vec3, placedLabel *[]string, bonds *[]Bond,
 					continue
 				}
 				nc := clashPts(pts)
+				if nc > 0 {
+					continue // reject any clash with protein
+				}
 				dev := math.Abs(finalDist - bondLen)
 				torDev := junctionTorsionDev(pts)
-				// Priority: 1) fewest clashes, 2) best junction torsions, 3) best bond length
+				burial := burialScore(pts)
+				// Priority: 1) most buried, 2) best torsions, 3) best bond length
 				if nc < bestClash ||
-					(nc == bestClash && torDev < bestTorDev) ||
-					(nc == bestClash && torDev == bestTorDev && dev < bestFinalDev) {
+					(nc == bestClash && burial > bestBurial) ||
+					(nc == bestClash && burial == bestBurial && torDev < bestTorDev) ||
+					(nc == bestClash && burial == bestBurial && torDev == bestTorDev && dev < bestFinalDev) {
 					bestClash = nc
 					bestFinalDev = dev
 					bestTorDev = torDev
+					bestBurial = burial
 					bestPts = pts
 					bestNInter = tryN
 				}
 			}
 		}
 		if bestPts == nil {
-			continue // no valid geometry found (pre-check should have caught this)
+			// Straight zigzag found no clash-free orientation — try beam-search
+			// pathfinding that can navigate around protein obstacles.
+			maxSearch := int(math.Ceil(firstAtomPos.Sub(lastAtomPos).Norm()/1.54)) + 3
+			if maxSearch > 20 {
+				maxSearch = 20
+			}
+			bestPts = buildChainPath(firstAtomPos, lastAtomPos, firstAtomDir, maxSearch, grid)
+			if bestPts == nil || len(bestPts) > 9 {
+				return
+			}
+			nInter = len(bestPts)
+		} else {
+			nInter = bestNInter
 		}
-		nInter = bestNInter
 
 		// Final validation: confirm the actual endpoint bond is valid.
 		var actualFinalPos Vec3
@@ -1678,21 +1608,16 @@ func linkProbeGroups(placedPos *[]Vec3, placedLabel *[]string, bonds *[]Bond,
 		} else {
 			actualFinalPos = bestPts[len(bestPts)-1]
 		}
-		finalBondLen := actualFinalPos.Sub(pos2).Norm()
+		finalBondLen := actualFinalPos.Sub(lastAtomPos).Norm()
 		if finalBondLen < 1.3 || finalBondLen > 1.65 {
-			continue
-		}
+				return
+			}
 
 		// Build clash mask for best orientation.
 		chainPts := bestPts
 		chainClash := make([]bool, len(chainPts))
 		for k, pt := range chainPts {
-			for _, h := range proteinHeavy {
-				if pt.Sub(h.pos).Norm() < h.vdwR+vdw("C")-hardTol {
-					chainClash[k] = true
-					break
-				}
-			}
+			chainClash[k] = !grid.clashFree(pt, vdw("C"), hardTol)
 		}
 
 		// Count clashing intermediate atoms.
@@ -1702,13 +1627,171 @@ func linkProbeGroups(placedPos *[]Vec3, placedLabel *[]string, bonds *[]Bond,
 				nClash++
 			}
 		}
-		// Reject only if every intermediate atom clashes (completely buried path).
-		if nInter > 0 && nClash == nInter {
-			continue
-		}
+		// Reject if any intermediate atom clashes with the protein.
+			if nClash > 0 {
+				return
+			}
 
+		// ── Try unsaturated linkers first (shorter, straighter) ─────────────
+		// Only attempt if the chain axis aligns reasonably with both tail atoms'
+		// outgoing bond directions (within 60° of collinear) — otherwise the
+		// sp3–sp junction angle would be severely distorted.
+		axisOK := func() bool {
+			if len(adj[a1]) > 0 {
+				nb := adj[a1][0]
+				outDir := pos1.Sub(positions[nb]).unit() // direction tail is already facing
+				if math.Abs(outDir.Dot(axis)) < 0.5 {    // > 60° off-axis
+					return false
+				}
+			}
+			if len(adj[a2]) > 0 {
+				nb := adj[a2][0]
+				outDir := pos2.Sub(positions[nb]).unit()
+				if math.Abs(outDir.Dot(axis)) < 0.5 {
+					return false
+				}
+			}
+			return true
+		}()
+		// atoms linearly along axis and check for clashes.  If valid, emit the
+		// pair ProbeSet immediately and skip the sp3 zigzag entirely.
+		//
+		// Motifs tried (from shortest to longest):
+		//   alkyne:  pos1 –C≡C– pos2   (linear, 2 atoms, ≈1.20 Å each bond)
+		//   alkene:  pos1 –C=C– pos2   (planar, 2 atoms, ≈1.34 Å each bond)
+		//   enyne:   pos1 –C=C–C≡C– pos2 (4 atoms)
+		//   diyne:   pos1 –C≡C–C≡C– pos2 (4 atoms)
+		type unsatMotif struct {
+			atoms []string  // element labels of intermediate atoms
+			bonds []int     // bond orders for each bond (len = len(atoms)+1)
+			blen  []float64 // ideal bond length for each bond
+		}
+		motifs := []unsatMotif{
+			{ // alkyne bridge: sp3–C≡C–sp3 (linear, 4.14 Å)
+				atoms: []string{"C", "C"},
+				bonds: []int{1, 3, 1},
+				blen:  []float64{1.47, 1.20, 1.47},
+			},
+			{ // diacetylene: sp3–C≡C–C≡C–sp3 (linear, 7.21 Å)
+				atoms: []string{"C", "C", "C", "C"},
+				bonds: []int{1, 3, 1, 3, 1},
+				blen:  []float64{1.47, 1.20, 1.37, 1.20, 1.47},
+			},
+		}
+		tryUnsaturated := func() bool {
+			for _, m := range motifs {
+				// Compute ideal end-to-end length for this motif.
+				idealTotal := 0.0
+				for _, bl := range m.blen {
+					idealTotal += bl
+				}
+				// Accept if distance matches within ±15%.
+				if math.Abs(chainDist-idealTotal)/idealTotal > 0.15 {
+					continue
+				}
+				// Place intermediate atoms linearly along axis.
+				var pts []Vec3
+				cur := pos1
+				for i, sym := range m.atoms {
+					bl := m.blen[i]
+					pt := cur.Add(axis.Scale(bl))
+					if !grid.clashFree(pt, vdw(sym), hardTol) {
+						pts = nil
+						break
+					}
+					pts = append(pts, pt)
+					cur = pt
+				}
+				if len(m.atoms) > 0 && len(pts) < len(m.atoms) {
+					continue // some atom clashed
+				}
+				// Validate final bond to pos2.
+				finalBl := m.blen[len(m.blen)-1]
+				if math.Abs(cur.Sub(pos2).Norm()-finalBl) > finalBl*0.15 {
+					continue
+				}
+				// Build independent ProbeSet for this pair.
+				var ps ProbeSet
+				remapC1 := make([]int, n)
+				for i, c := range comp {
+					if c == p.c1 {
+						remapC1[i] = ps.Add(positions[i], labels[i])
+					}
+				}
+				for _, b := range *bonds {
+					if comp[b.I-1] == p.c1 && comp[b.J-1] == p.c1 {
+						ps.Bond(remapC1[b.I-1], remapC1[b.J-1], b.Order)
+					}
+				}
+				remapC2 := make([]int, n)
+				for i, c := range comp {
+					if c == p.c2 {
+						remapC2[i] = ps.Add(positions[i], labels[i])
+					}
+				}
+				for _, b := range *bonds {
+					if comp[b.I-1] == p.c2 && comp[b.J-1] == p.c2 {
+						ps.Bond(remapC2[b.I-1], remapC2[b.J-1], b.Order)
+					}
+				}
+				pa1 := remapC1[a1]
+				pa2 := remapC2[a2]
+				linkerBase := ps.Len() + 1
+				for _, pt := range pts {
+					ps.Add(pt, "C")
+				}
+				prev := pa1
+				for i := range pts {
+					ps.Bond(prev, linkerBase+i, m.bonds[i])
+					prev = linkerBase + i
+				}
+				ps.Bond(prev, pa2, m.bonds[len(m.bonds)-1])
+				outCh <- pairOut{ps: ps, a1: a1, a2: a2, c1: p.c1, c2: p.c2, d: p.d}
+				return true
+			}
+			return false
+		}
+		if axisOK && tryUnsaturated() {
+				return
+			}
 		if nInter == 0 {
-			*bonds = append(*bonds, Bond{a1 + 1, a2 + 1, 1})
+			// No intermediate zigzag atoms: connect via the two end-cap atoms only.
+			// Chain: pa1 → firstAtomPos → lastAtomPos → pa2.
+			if d := firstAtomPos.Sub(lastAtomPos).Norm(); d < 1.3 || d > 1.65 {
+				return
+			}
+			var ps ProbeSet
+			remapC1 := make([]int, n)
+			for i, c := range comp {
+				if c == p.c1 {
+					remapC1[i] = ps.Add(positions[i], labels[i])
+				}
+			}
+			for _, b := range *bonds {
+				if comp[b.I-1] == p.c1 && comp[b.J-1] == p.c1 {
+					ps.Bond(remapC1[b.I-1], remapC1[b.J-1], b.Order)
+				}
+			}
+			remapC2 := make([]int, n)
+			for i, c := range comp {
+				if c == p.c2 {
+					remapC2[i] = ps.Add(positions[i], labels[i])
+				}
+			}
+			for _, b := range *bonds {
+				if comp[b.I-1] == p.c2 && comp[b.J-1] == p.c2 {
+					ps.Bond(remapC2[b.I-1], remapC2[b.J-1], b.Order)
+				}
+			}
+			pa1 := remapC1[a1]
+			pa2 := remapC2[a2]
+			fi := ps.Add(firstAtomPos, "C")
+			li := ps.Add(lastAtomPos, "C")
+			ps.Bond(pa1, fi, 1)
+			ps.Bond(fi, li, 1)
+			ps.Bond(li, pa2, 1)
+			outCh <- pairOut{ps: ps, a1: a1, a2: a2, c1: p.c1, c2: p.c2, d: p.d}
+			return
 		} else {
 			var kept []int
 			for k, cl := range chainClash {
@@ -1731,70 +1814,733 @@ func linkProbeGroups(placedPos *[]Vec3, placedLabel *[]string, bonds *[]Bond,
 				prevPos = chainPts[k]
 			}
 			if !bad {
-				if prevPos.Sub(pos2).Norm() < 1.3 && len(kept) > 0 {
+				if prevPos.Sub(lastAtomPos).Norm() < 1.3 && len(kept) > 0 {
 					kept = kept[:len(kept)-1]
 					prevPos = pos1
 					for _, k := range kept {
 						prevPos = chainPts[k]
 					}
 				}
-				if !bondOK(prevPos, pos2) {
+				if !bondOK(prevPos, lastAtomPos) {
 					bad = true
 				}
 			}
 			if bad {
 				kept = make([]int, nInter)
-				for k := range kept {
-					kept[k] = k
-				}
+				for k := range kept { kept[k] = k }
 			}
 
 			globalIdx := make([]int, len(chainPts))
-			chainBase := len(positions) + 1
 			placed2 := 0
+			// Build into a local ProbeSet: copy probe atoms from both components,
+			// then append the linker chain atoms and bond everything together.
+			var ps ProbeSet
+
+			// Remap: copy all atoms in component c1.
+			remapC1 := make([]int, n)
+			for i, c := range comp {
+				if c == p.c1 {
+					idx := ps.Add(positions[i], labels[i])
+					remapC1[i] = idx
+				}
+			}
+			// Copy bonds within component c1.
+			for _, b := range *bonds {
+				if comp[b.I-1] == p.c1 && comp[b.J-1] == p.c1 {
+					ps.Bond(remapC1[b.I-1], remapC1[b.J-1], b.Order)
+				}
+			}
+			// Remap: copy all atoms in component c2.
+			remapC2 := make([]int, n)
+			for i, c := range comp {
+				if c == p.c2 {
+					idx := ps.Add(positions[i], labels[i])
+					remapC2[i] = idx
+				}
+			}
+			for _, b := range *bonds {
+				if comp[b.I-1] == p.c2 && comp[b.J-1] == p.c2 {
+					ps.Bond(remapC2[b.I-1], remapC2[b.J-1], b.Order)
+				}
+			}
+			// Now add linker chain atoms and connect a1→firstAtom→chain→a2.
+			pa1 := remapC1[a1]
+			pa2 := remapC2[a2]
+			chainBase := ps.Len() + 1
+			// First: add the tetrahedral entry atom at firstAtomPos.
+			firstAtomGlobalIdx := ps.Add(firstAtomPos, "C")
+			ps.Bond(pa1, firstAtomGlobalIdx, 1)
+			// Then: add remaining zigzag chain atoms.
+			placed2 = 0
 			for _, k := range kept {
-				positions = append(positions, chainPts[k])
-				labels = append(labels, "C")
-				globalIdx[k] = chainBase + placed2
+				ps.Add(chainPts[k], "C")
+				globalIdx[k] = chainBase + 1 + placed2
 				placed2++
 			}
-			prev := a1 + 1
+			prev := firstAtomGlobalIdx
 			for _, k := range kept {
-				*bonds = append(*bonds, Bond{prev, globalIdx[k], 1})
+				ps.Bond(prev, globalIdx[k], 1)
 				prev = globalIdx[k]
 			}
-			*bonds = append(*bonds, Bond{prev, a2 + 1, 1})
+			// Add the sp2-aware exit atom at the a2 end, then bond to pa2.
+			lastAtomGlobalIdx := ps.Add(lastAtomPos, "C")
+			ps.Bond(prev, lastAtomGlobalIdx, 1)
+			ps.Bond(lastAtomGlobalIdx, pa2, 1)
+			ps.C1 = p.c1
+			ps.C2 = p.c2
+			outCh <- pairOut{ps: ps, a1: a1, a2: a2, c1: p.c1, c2: p.c2, d: p.d}
 		}
-
-		bondCount[a1]++
-		bondCount[a2]++
-		// Pin both tails to prevent a second linker bond.
-		if bondCount[a1] < maxValence(labels[a1]) {
-			bondCount[a1] = maxValence(labels[a1])
-		}
-		if bondCount[a2] < maxValence(labels[a2]) {
-			bondCount[a2] = maxValence(labels[a2])
-		}
-		// Mark both tails as used — each original component's tail accepts
-		// exactly one linker bond.
-		tailUsed[p.c1] = true
-		tailUsed[p.c2] = true
-		// Union: merge smaller into larger (by compSize), update size.
-		if compSize[r1] < compSize[r2] {
-			r1, r2 = r2, r1
-		}
-		parent[r2] = r1
-		compSize[r1] += compSize[r2]
-		linked++
+		}()
 	}
 
-	*placedPos = positions
-	*placedLabel = labels
-	return linked
+	go func() { wg.Wait(); close(outCh) }()
+
+	// Collect all results, sort by pair distance, then greedily assign each
+	// probe component to at most one output molecule (nearest-first).
+	var outs []pairOut
+	for out := range outCh {
+		outs = append(outs, out)
+	}
+	sort.Slice(outs, func(i, j int) bool { return outs[i].d < outs[j].d })
+
+	usedComp := make(map[int]bool)
+	var result []ProbeSet
+	for _, out := range outs {
+		if usedComp[out.c1] || usedComp[out.c2] {
+			continue
+		}
+		result = append(result, out.ps)
+		usedComp[out.c1] = true
+		usedComp[out.c2] = true
+	}
+
+	return result
 }
 
 
-// addBackbone appends every residue's backbone atoms (N, CA, C, O) to the
+// amideVariants generates ProbeSet variants where each adjacent pair of sp3
+// chain carbons (degree 2, all single bonds) is replaced with an amide group:
+// one C becomes C=O (sp2, 1.22 Å) and the adjacent C becomes N.  Both
+// orientations of the amide are tried.  Only variants where the carbonyl O
+// clears the protein are kept.
+func amideVariants(mol ProbeSet, grid *clashGrid) []ProbeSet {
+	n := len(mol.Pos)
+	degree := make([]int, n)
+	adj := make([][]int, n)
+	for _, b := range mol.Bonds {
+		i, j := b.I-1, b.J-1
+		degree[i]++
+		degree[j]++
+		adj[i] = append(adj[i], j)
+		adj[j] = append(adj[j], i)
+	}
+
+	// isChainC: sp3 carbon with exactly 2 single bonds.
+	isChainC := func(idx int) bool {
+		if mol.Labels[idx] != "C" || degree[idx] != 2 {
+			return false
+		}
+		for _, b := range mol.Bonds {
+			if (b.I-1 == idx || b.J-1 == idx) && b.Order != 1 {
+				return false
+			}
+		}
+		return true
+	}
+
+	var variants []ProbeSet
+	seen := make(map[[2]int]bool)
+
+	for _, b := range mol.Bonds {
+		if b.Order != 1 {
+			continue
+		}
+		i, j := b.I-1, b.J-1
+		if !isChainC(i) || !isChainC(j) {
+			continue
+		}
+		// Try both orientations: (i=C=O, j=N) and (j=C=O, i=N).
+		for _, pair := range [][2]int{{i, j}, {j, i}} {
+			carbonIdx, nitroIdx := pair[0], pair[1]
+			key := [2]int{carbonIdx, nitroIdx}
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+
+			cPos := mol.Pos[carbonIdx]
+			nPos := mol.Pos[nitroIdx]
+
+			// Predecessor of carbonIdx (its other neighbour).
+			predIdx := -1
+			for _, nb := range adj[carbonIdx] {
+				if nb != nitroIdx {
+					predIdx = nb
+					break
+				}
+			}
+
+			// Skip if carbonIdx is bonded to a probe heteroatom — that junction
+			// carbon is sp3 and must not become a C=O.
+			if predIdx >= 0 && mol.Labels[predIdx] != "C" {
+				continue
+			}
+
+			// Carbonyl O direction: sp2 bisector at C (120° from both bonds).
+			var v1 Vec3
+			if predIdx >= 0 {
+				v1 = mol.Pos[predIdx].Sub(cPos).unit()
+			} else {
+				v1 = nPos.Sub(cPos).Scale(-1).unit()
+			}
+			v2 := nPos.Sub(cPos).unit()
+			sumVec := v1.Add(v2)
+			if sumVec.Norm() < 1e-6 {
+				continue
+			}
+			oDir := sumVec.Scale(-1).unit()
+			oPos := cPos.Add(oDir.Scale(1.22))
+
+			// Reposition N to the sp2 amide plane: third 120° direction at C.
+			// v1 (to pred) + oDir (to O) + vN (to N) = 0 for ideal sp2.
+			vN := v1.Add(oDir).Scale(-1)
+			if vN.Norm() < 1e-6 {
+				continue
+			}
+			newNPos := cPos.Add(vN.unit().Scale(1.33))
+
+			if !grid.clashFree(oPos, vdw("O"), hardTol) {
+				continue
+			}
+			if !grid.clashFree(newNPos, vdw("N"), hardTol) {
+				continue
+			}
+			// Require the carbonyl O or the amide N to be near a protein atom —
+			// otherwise the amide points into solvent and adds no H-bond value.
+			if grid.countNearby(oPos, 0.0, 3.5) == 0 && grid.countNearby(newNPos, 0.0, 3.5) == 0 {
+				continue
+			}
+
+			// Build variant: copy mol, place N at sp2 amide position, add O.
+			var v ProbeSet
+			for k, p := range mol.Pos {
+				lbl := mol.Labels[k]
+				pos := p
+				if k == nitroIdx {
+					lbl = "N"
+					pos = newNPos
+				}
+				v.Add(pos, lbl)
+			}
+			for _, bond := range mol.Bonds {
+				v.Bond(bond.I, bond.J, bond.Order)
+			}
+			oIdx := v.Add(oPos, "O")
+			v.Bond(carbonIdx+1, oIdx, 2) // 1-based, double bond
+			variants = append(variants, v)
+		}
+	}
+	return variants
+}
+
+// linkMoleculeGroups connects each assembled 2-probe molecule to its nearest
+// neighbour molecule by their nearest atoms, producing larger merged molecules.
+// Each input molecule is used at most once (greedy nearest-first matching).
+// maxDist is the maximum inter-molecule atom distance to attempt linking.
+func linkMoleculeGroups(mols []ProbeSet, proteinHeavy []heavyAtom, maxDist float64) []ProbeSet {
+	grid := newClashGrid(proteinHeavy)
+	if len(mols) < 2 {
+		return nil
+	}
+
+	// Build local adjacency list and sp2 flag for one ProbeSet.
+	molAdj := func(ps ProbeSet) [][]int {
+		adj := make([][]int, len(ps.Pos))
+		for _, b := range ps.Bonds {
+			i, j := b.I-1, b.J-1
+			adj[i] = append(adj[i], j)
+			adj[j] = append(adj[j], i)
+		}
+		return adj
+	}
+	molSp2 := func(ps ProbeSet, idx int) bool {
+		for _, b := range ps.Bonds {
+			if (b.I-1 == idx || b.J-1 == idx) && (b.Order == 2 || b.Order == 4) {
+				return true
+			}
+		}
+		return false
+	}
+
+	// exitDir computes the sp2-aware exit direction from atom idx in ps.
+	// preferDir is a hint for the preferred half-space (e.g. toward the other probe).
+	exitDir := func(ps ProbeSet, idx int, adj [][]int, preferDir Vec3) Vec3 {
+		pos := ps.Pos[idx]
+		nbs := adj[idx]
+		if len(nbs) >= 2 && molSp2(ps, idx) {
+			sum := Vec3{}
+			for _, nb := range nbs {
+				sum = sum.Add(ps.Pos[nb].Sub(pos).unit())
+			}
+			if sum.Norm() > 1e-6 {
+				return sum.Scale(-1).unit()
+			}
+		} else if len(nbs) == 1 {
+			incoming := pos.Sub(ps.Pos[nbs[0]]).unit()
+			baseP := perpendicular(incoming)
+			p2 := cross3(incoming, baseP)
+			const cosT, sinT = -0.333, 0.9428
+			best := -2.0
+			dir := preferDir
+			for oi := 0; oi < 12; oi++ {
+				ang := float64(oi) * math.Pi / 6
+				perp := baseP.Scale(math.Cos(ang)).Add(p2.Scale(math.Sin(ang)))
+				d := incoming.Scale(cosT).Add(perp.Scale(sinT)).unit()
+				if d.Dot(preferDir) > best {
+					best = d.Dot(preferDir)
+					dir = d
+				}
+			}
+			return dir
+		}
+		return preferDir
+	}
+
+	type candidate struct {
+		i, j   int
+		a1, a2 int
+		d      float64
+	}
+	var cands []candidate
+	for i := 0; i < len(mols); i++ {
+		for j := i + 1; j < len(mols); j++ {
+			bestD := math.MaxFloat64
+			bestA1, bestA2 := -1, -1
+			for a1, p1 := range mols[i].Pos {
+				for a2, p2 := range mols[j].Pos {
+					d := p1.Sub(p2).Norm()
+					if d >= 2.0 && d < bestD {
+						bestD = d
+						bestA1, bestA2 = a1, a2
+					}
+				}
+			}
+			if bestA1 >= 0 && bestD <= maxDist {
+				cands = append(cands, candidate{i, j, bestA1, bestA2, bestD})
+			}
+		}
+	}
+	sort.Slice(cands, func(a, b int) bool { return cands[a].d < cands[b].d })
+
+	type pairOut struct {
+		ps   ProbeSet
+		i, j int
+		d    float64
+	}
+	outCh := make(chan pairOut, len(cands))
+	nCPU := runtime.NumCPU()
+	sem := make(chan struct{}, nCPU)
+	var wg sync.WaitGroup
+
+	for _, c := range cands {
+		c := c
+		sem <- struct{}{}
+		wg.Add(1)
+		go func() {
+			defer func() { <-sem; wg.Done() }()
+
+			mol1, mol2 := mols[c.i], mols[c.j]
+			adj1 := molAdj(mol1)
+			adj2 := molAdj(mol2)
+			pos1 := mol1.Pos[c.a1]
+			pos2 := mol2.Pos[c.a2]
+			axis := pos2.Sub(pos1).unit()
+
+			firstAtomDir := exitDir(mol1, c.a1, adj1, axis)
+			lastAtomDir := exitDir(mol2, c.a2, adj2, axis.Scale(-1))
+
+			firstAtomPos := pos1.Add(firstAtomDir.Scale(1.54))
+			lastAtomPos := pos2.Add(lastAtomDir.Scale(1.54))
+
+			const (
+				bondLen = 1.54
+				cosA    = 0.8165
+				sinA    = 0.578
+			)
+			remDist := firstAtomPos.Sub(lastAtomPos).Norm()
+			nBase := int(math.Round(remDist/1.258)) - 1
+			if nBase < 0 {
+				nBase = 0
+			}
+			nInter := nBase
+			if nInter == 0 && remDist > 1.60 {
+				nInter = 1
+			}
+			remAxis := lastAtomPos.Sub(firstAtomPos).unit()
+
+			basePerp := func() Vec3 {
+				away := firstAtomDir.Sub(remAxis.Scale(firstAtomDir.Dot(remAxis)))
+				if away.Norm() > 0.1 {
+					return away.Scale(-1).unit()
+				}
+				return perpendicular(remAxis)
+			}()
+			perp2 := cross3(remAxis, basePerp).unit()
+
+			sRatio := func(n int) float64 {
+				type pt2 struct{ u, v float64 }
+				local := make([]pt2, n+2)
+				for k := 1; k <= n+1; k++ {
+					sign := 1.0
+					if (k-1)%2 == 1 {
+						sign = -1
+					}
+					local[k] = pt2{local[k-1].u + cosA * bondLen, local[k-1].v + sign*sinA*bondLen}
+				}
+				eu, ev := local[n+1].u, local[n+1].v
+				return remDist / math.Sqrt(eu*eu+ev*ev)
+			}
+
+			buildZigzag := func(n int, perpV Vec3) ([]Vec3, float64) {
+				if n == 0 {
+					return nil, firstAtomPos.Sub(lastAtomPos).Norm()
+				}
+				type pt2 struct{ u, v float64 }
+				local := make([]pt2, n+2)
+				for k := 1; k <= n+1; k++ {
+					sign := 1.0
+					if (k-1)%2 == 1 {
+						sign = -1
+					}
+					local[k] = pt2{local[k-1].u + cosA*bondLen, local[k-1].v + sign*sinA*bondLen}
+				}
+				eu, ev := local[n+1].u, local[n+1].v
+				idealLen := math.Sqrt(eu*eu + ev*ev)
+				s := remDist / idealLen
+				cosθ := eu / idealLen
+				sinθ := ev / idealLen
+				pts := make([]Vec3, n)
+				for k := 1; k <= n; k++ {
+					u, v := local[k].u, local[k].v
+					ru := (u*cosθ + v*sinθ) * s
+					rv := (-u*sinθ + v*cosθ) * s
+					pts[k-1] = firstAtomPos.Add(remAxis.Scale(ru)).Add(perpV.Scale(rv))
+				}
+				return pts, pts[n-1].Sub(lastAtomPos).Norm()
+			}
+
+			clashFree := func(pts []Vec3) bool {
+				for _, pt := range pts {
+					if !grid.clashFree(pt, vdw("C"), hardTol) {
+						return false
+					}
+				}
+				return true
+			}
+
+			// Pre-check any valid orientation exists.
+			anyValid := false
+			for tryN := nInter - 3; tryN <= nInter+3 && !anyValid; tryN++ {
+				if tryN < 0 || tryN > 9 {
+					continue
+				}
+				s := sRatio(tryN)
+				if s < 0.85 || s > 1.15 {
+					continue
+				}
+				for oi := 0; oi < 36 && !anyValid; oi++ {
+					ang := float64(oi) * math.Pi / 18
+					tp := basePerp.Scale(math.Cos(ang)).Add(perp2.Scale(math.Sin(ang)))
+					_, d := buildZigzag(tryN, tp)
+					if d >= 1.3 && d <= 1.65 {
+						anyValid = true
+						nInter = tryN
+					}
+				}
+			}
+			if !anyValid {
+				return
+			}
+
+			// Main search: find best orientation (fewest clashes, most buried).
+			var bestPts []Vec3
+			bestClash := math.MaxInt32
+			bestBurial := -1
+			bestFinalDev := math.MaxFloat64
+			bestNInter := nInter
+
+			for _, tryN := range []int{nInter - 3, nInter - 2, nInter - 1, nInter, nInter + 1, nInter + 2, nInter + 3} {
+				if tryN < 0 || tryN > 9 {
+					continue
+				}
+				s := sRatio(tryN)
+				if s < 0.85 || s > 1.15 {
+					continue
+				}
+				for oi := 0; oi < 36; oi++ {
+					ang := float64(oi) * math.Pi / 18
+					perp := basePerp.Scale(math.Cos(ang)).Add(perp2.Scale(math.Sin(ang)))
+					pts, finalDist := buildZigzag(tryN, perp)
+					if finalDist < 1.3 || finalDist > 1.65 {
+						continue
+					}
+					if !clashFree(pts) {
+						continue
+					}
+					dev := math.Abs(finalDist - bondLen)
+					burial := grid.countNearby(firstAtomPos, 2.0, 6.0)
+					nc := 0
+					if nc < bestClash || (nc == bestClash && burial > bestBurial) ||
+						(nc == bestClash && burial == bestBurial && dev < bestFinalDev) {
+						bestClash = nc
+						bestFinalDev = dev
+						bestBurial = burial
+						bestPts = pts
+						bestNInter = tryN
+					}
+				}
+			}
+			if bestPts == nil {
+				maxSearch := int(math.Ceil(remDist/1.54)) + 3
+				if maxSearch > 20 {
+					maxSearch = 20
+				}
+				bestPts = buildChainPath(firstAtomPos, lastAtomPos, firstAtomDir, maxSearch, grid)
+				if bestPts == nil || len(bestPts) > 9 {
+					return
+				}
+				nInter = len(bestPts)
+			} else {
+				nInter = bestNInter
+			}
+
+			// Validate final bond length.
+			var actualFinal Vec3
+			if len(bestPts) == 0 {
+				actualFinal = firstAtomPos
+			} else {
+				actualFinal = bestPts[len(bestPts)-1]
+			}
+			if d := actualFinal.Sub(lastAtomPos).Norm(); d < 1.3 || d > 1.65 {
+				return
+			}
+
+			// Handle nInter == 0: direct bond between end-cap atoms.
+			if nInter == 0 {
+				if d := firstAtomPos.Sub(lastAtomPos).Norm(); d < 1.3 || d > 1.65 {
+					return
+				}
+			}
+
+			// Merge mol1 + mol2 + linker into one ProbeSet.
+			var ps ProbeSet
+			n1 := len(mol1.Pos)
+			for i, p := range mol1.Pos {
+				ps.Add(p, mol1.Labels[i])
+			}
+			for _, b := range mol1.Bonds {
+				ps.Bond(b.I, b.J, b.Order)
+			}
+			offset := n1
+			for i, p := range mol2.Pos {
+				ps.Add(p, mol2.Labels[i])
+				_ = offset
+			}
+			for _, b := range mol2.Bonds {
+				ps.Bond(b.I+n1, b.J+n1, b.Order)
+			}
+			pa1 := c.a1 + 1             // 1-based in merged ps
+			pa2 := c.a2 + n1 + 1        // 1-based in merged ps
+
+			fiIdx := ps.Add(firstAtomPos, "C")
+			ps.Bond(pa1, fiIdx, 1)
+
+			prev := fiIdx
+			for _, pt := range bestPts {
+				idx := ps.Add(pt, "C")
+				ps.Bond(prev, idx, 1)
+				prev = idx
+			}
+
+			liIdx := ps.Add(lastAtomPos, "C")
+			ps.Bond(prev, liIdx, 1)
+			ps.Bond(liIdx, pa2, 1)
+
+			outCh <- pairOut{ps: ps, i: c.i, j: c.j, d: c.d}
+		}()
+	}
+	go func() { wg.Wait(); close(outCh) }()
+
+	// Collect, sort, greedy match.
+	var outs []pairOut
+	for out := range outCh {
+		outs = append(outs, out)
+	}
+	sort.Slice(outs, func(a, b int) bool { return outs[a].d < outs[b].d })
+
+	usedMol := make(map[int]bool)
+	var result []ProbeSet
+	for _, out := range outs {
+		if usedMol[out.i] || usedMol[out.j] {
+			continue
+		}
+		result = append(result, out.ps)
+		usedMol[out.i] = true
+		usedMol[out.j] = true
+	}
+	return result
+}
+
+// linkTripleGroups builds tri-pharmacophoric molecules by finding pairs of
+// pairwise-linked ProbeSets that share exactly one probe component (the hub),
+// then merging them into a single A–hub–C molecule.
+// Uses the C1/C2 component indices set by linkProbeGroups.
+func linkTripleGroups(pairs []ProbeSet, maxDist float64) []ProbeSet {
+	var triples []ProbeSet
+
+	// Index pairs by their component sets for quick lookup.
+	type compKey [2]int
+	key := func(p ProbeSet) compKey {
+		if p.C1 <= p.C2 { return compKey{p.C1, p.C2} }
+		return compKey{p.C2, p.C1}
+	}
+
+	// For each pair of pairs: check if they share exactly one component.
+	for i := 0; i < len(pairs); i++ {
+		pi := pairs[i]
+		if pi.C1 < 0 || pi.C2 < 0 { continue }
+		for j := i + 1; j < len(pairs); j++ {
+			pj := pairs[j]
+			if pj.C1 < 0 || pj.C2 < 0 { continue }
+			// Skip if they connect the same component pair.
+			if key(pi) == key(pj) { continue }
+
+			// Find the shared component (hub) and the two outer components.
+			var hub, cA, cB int
+			switch {
+			case pi.C1 == pj.C1: hub, cA, cB = pi.C1, pi.C2, pj.C2
+			case pi.C1 == pj.C2: hub, cA, cB = pi.C1, pi.C2, pj.C1
+			case pi.C2 == pj.C1: hub, cA, cB = pi.C2, pi.C1, pj.C2
+			case pi.C2 == pj.C2: hub, cA, cB = pi.C2, pi.C1, pj.C1
+			default: continue // no shared component
+			}
+			_ = hub
+
+			// Ensure A and C are not directly connected to each other
+			// (avoid redundant connections).
+			alreadyLinked := false
+			for k := 0; k < len(pairs); k++ {
+				pk := pairs[k]
+				if (pk.C1 == cA && pk.C2 == cB) || (pk.C1 == cB && pk.C2 == cA) {
+					alreadyLinked = true
+					break
+				}
+			}
+			if alreadyLinked { continue }
+
+			merged, ok := mergeTriple(pi, pj)
+			if !ok { continue }
+
+			// Reject if total span is unreasonably large.
+			maxD := 0.0
+			for a := 0; a < len(merged.Pos); a++ {
+				for b := a + 1; b < len(merged.Pos); b++ {
+					if d := merged.Pos[a].Sub(merged.Pos[b]).Norm(); d > maxD {
+						maxD = d
+					}
+				}
+			}
+			if maxD > maxDist*1.5 { continue }
+
+			triples = append(triples, merged)
+		}
+	}
+	return triples
+}
+
+// mergeTriple attempts to merge two pairwise-linked ProbeSets that share a
+// common probe component.  Returns the merged ProbeSet and true on success.
+// The two molecules must have a "hub" region — a set of atoms present in both
+// ProbeSets at the same positions — with at least 3 distinct atoms so we can
+// confirm it's a real probe, not an accidental overlap.
+func mergeTriple(a, b ProbeSet) (ProbeSet, bool) {
+	const posTol = 0.05 // Å — atoms at same position are considered identical
+
+	// Find which atoms in b correspond to atoms in a (the shared hub).
+	// remapB[i] = index in a of atom b.Pos[i], or -1 if not shared.
+	remapB := make([]int, len(b.Pos))
+	for i := range remapB {
+		remapB[i] = -1
+	}
+	sharedCount := 0
+	for bi, bp := range b.Pos {
+		for ai, ap := range a.Pos {
+			if bp.Sub(ap).Norm() < posTol && b.Labels[bi] == a.Labels[ai] {
+				remapB[bi] = ai
+				sharedCount++
+				break
+			}
+		}
+	}
+
+	// Need enough shared atoms to be a real probe overlap (not coincidence).
+	if sharedCount < 3 {
+		return ProbeSet{}, false
+	}
+
+	// The shared atoms form the "hub" probe.  Atoms in b that are NOT shared
+	// are b's unique probe + its linker chain — append them to a.
+	merged := ProbeSet{}
+	// Copy all of a.
+	for k, p := range a.Pos {
+		merged.Add(p, a.Labels[k])
+	}
+	for _, bond := range a.Bonds {
+		merged.Bond(bond.I, bond.J, bond.Order)
+	}
+
+	// Map from b's atom index to merged atom index.
+	bToMerged := make([]int, len(b.Pos))
+	for bi := range b.Pos {
+		if remapB[bi] >= 0 {
+			bToMerged[bi] = remapB[bi] + 1 // 1-based, same position as in a
+		} else {
+			// New atom — append.
+			idx := merged.Add(b.Pos[bi], b.Labels[bi])
+			bToMerged[bi] = idx
+		}
+	}
+	// Copy b's bonds, remapped.
+	for _, bond := range b.Bonds {
+		newI := bToMerged[bond.I-1]
+		newJ := bToMerged[bond.J-1]
+		// Skip if this bond already exists in merged (shared hub bonds).
+		exists := false
+		for _, existing := range merged.Bonds {
+			if (existing.I == newI && existing.J == newJ) ||
+				(existing.I == newJ && existing.J == newI) {
+				exists = true
+				break
+			}
+		}
+		if !exists {
+			merged.Bond(newI, newJ, bond.Order)
+		}
+	}
+	merged.Name = fmt.Sprintf("triple-%da-%db", len(a.Pos), len(b.Pos))
+	// Reject pure-carbon triples (no pharmacophoric value).
+	hasHet := false
+	for _, lbl := range merged.Labels {
+		switch strings.ToUpper(lbl) {
+		case "N", "O", "S", "F", "CL":
+			hasHet = true
+		}
+	}
+	if !hasHet {
+		return ProbeSet{}, false
+	}
+	return merged, true
+}
 // placed atom lists.  Intra-residue bonds (N–CA single, CA–C single, C=O
 // double) and inter-residue peptide bonds (distance-gated at < 2 Å) are added
 // so the backbone appears as one connected SDF entry.

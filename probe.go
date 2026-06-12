@@ -7,9 +7,12 @@ type Bond struct{ I, J, Order int }
 // ProbeSet accumulates the atoms and bonds of all placed probes.
 // It is the single mutable output passed through the placement pipeline.
 type ProbeSet struct {
-	Pos    []Vec3
-	Labels []string
-	Bonds  []Bond
+	Pos       []Vec3
+	Labels    []string
+	Bonds     []Bond
+	Name      string // optional label (used for ring scan variants)
+	ParentIdx int    // index of the original linked pair this was grown from (-1 = original)
+	C1, C2    int    // probe component indices this pair connects (-1 if unknown)
 }
 
 // Add appends a new atom and returns its 1-based index.

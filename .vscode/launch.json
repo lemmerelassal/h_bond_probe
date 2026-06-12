@@ -7,7 +7,7 @@
             "request": "launch",
             "mode": "auto",
             "program": "${workspaceFolder}",
-            "args": ["5ENB"]
+            "args": ["-nocarbonyl", "-input", "A0A0L0NRM7_linear.sdf", "-input", "A0A0L0NRM7_rings.sdf", "-input", "A0A0L0NRM7_carbonyls.sdf", "-alphafold", "-start", "287", "-end", "416", "A0A0L0NRM7"]
         }
     ]
 }

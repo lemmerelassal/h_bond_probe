@@ -1,26 +1,70 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"math"
 	"os"
 	"sort"
 	"strings"
+	"time"
 )
 
+// noCarbonyl disables placement of carbonyl-containing groups (ketone, amide,
+// urea, guanidine, thiourea, imine, etc.) during generation.
+// Molecules imported via -input are unaffected.
+var noCarbonyl bool
+
+// multiFlag is a repeatable string flag (e.g. -input a.sdf -input b.sdf).
+type multiFlag []string
+
+func (m *multiFlag) String() string        { return strings.Join(*m, ",") }
+func (m *multiFlag) Set(v string) error    { *m = append(*m, v); return nil }
+
 func main() {
-	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "Usage: pharmacophore <PDB-ID|file.pdb|file.cif>")
+	alphafold := flag.Bool("alphafold", false, "Fetch structure from AlphaFold DB instead of RCSB PDB")
+	startRes := flag.Int("start", 0, "First residue number to include (0 = all)")
+	endRes := flag.Int("end", 0, "Last residue number to include (0 = all)")
+	flag.BoolVar(&noCarbonyl, "nocarbonyl", false, "Skip placing carbonyl-containing groups (urea, amide, guanidine, etc.); -input molecules are unaffected")
+	var inputSDFs multiFlag
+	flag.Var(&inputSDFs, "input", "SDF file of existing probes to import (may be repeated)")
+	flag.Parse()
+
+	args := flag.Args()
+	if len(args) < 1 {
+		fmt.Fprintln(os.Stderr, "Usage: pharmacophore [flags] <PDB-ID|UniProt-ID|file.pdb|file.cif>")
+		fmt.Fprintln(os.Stderr, "Flags:")
+		flag.PrintDefaults()
 		os.Exit(1)
 	}
 
-	atoms, pdbID, err := LoadAtoms(os.Args[1])
+	atoms, pdbID, err := LoadAtoms(args[0], *alphafold)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
 	if len(atoms) == 0 {
 		fmt.Fprintln(os.Stderr, "No atoms parsed.")
+		os.Exit(1)
+	}
+
+	// Apply residue range filter if requested.
+	if *startRes > 0 || *endRes > 0 {
+		var filtered []Atom
+		for _, a := range atoms {
+			if *startRes > 0 && a.ResSeq < *startRes {
+				continue
+			}
+			if *endRes > 0 && a.ResSeq > *endRes {
+				continue
+			}
+			filtered = append(filtered, a)
+		}
+		fmt.Printf("Residue range %d–%d: %d → %d atoms\n", *startRes, *endRes, len(atoms), len(filtered))
+		atoms = filtered
+	}
+	if len(atoms) == 0 {
+		fmt.Fprintln(os.Stderr, "No atoms in specified residue range.")
 		os.Exit(1)
 	}
 
@@ -49,37 +93,448 @@ func main() {
 	// ── Initialise the probe accumulator ─────────────────────────────────────
 	ps := &ProbeSet{}
 
+	for _, path := range inputSDFs {
+		mols, err := ReadSDF(path)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error reading input SDF: %v\n", err)
+			os.Exit(1)
+		}
+		before := len(mols)
+		mols = DeduplicateMols(mols, 1.0)
+		fmt.Printf("Imported %d molecules from %s (%d duplicates removed)\n", len(mols), path, before-len(mols))
+		for _, mol := range mols {
+			offset := ps.Len()
+			for i, p := range mol.Pos {
+				ps.Add(p, mol.Labels[i])
+			}
+			for _, b := range mol.Bonds {
+				ps.Bond(offset+b.I, offset+b.J, b.Order)
+			}
+		}
+	}
+
+	t0 := time.Now()
+	tick := func(label string) {
+		fmt.Printf("  %-40s %v\n", label, time.Since(t0).Round(time.Millisecond))
+		t0 = time.Now()
+	}
+
 	// ── Alkane chain through hydrophobic intersection points ──────────────────
 	buildAlkaneChain(hydro, heavy, ps)
+	tick("alkane chain")
 
 	// ── Benzene / imidazole ring probes for aromatic residues ─────────────────
 	buildAromaticProbes(proteinAtoms, heavy, ps)
+	tick("aromatic probes")
 
 	// ── H-bond acceptor / donor vote probes ──────────────────────────────────
 	buildHbondProbes(proteinAtoms, heavy, ps)
+	tick("h-bond probes")
 
 	// ── Pharmacophoric probes (Open/Closed: iterate AllPlacers) ───────────────
 	for _, p := range AllPlacers {
 		n := p.Place(proteinAtoms, heavy, ps)
 		fmt.Printf("%s probes: %d\n", p.Name(), n)
 	}
+	tick("pharmacophoric probes")
 
-	// ── Link probe groups into multi-fragment molecules ───────────────────────
+	// ── Ring SAR scan ─────────────────────────────────────────────────────────
+	fmt.Println("Running ring SAR scan...")
+	ringScanPairs := ScanRings(ps, heavy)
+	fmt.Printf("Ring scan variants: %d\n", len(ringScanPairs))
+	tick("ring SAR scan")
+
+	// ── Link probe groups into independent pair molecules ─────────────────────
+	// Each probe is used at most once (greedy nearest-neighbor matching).
+	// The linker chain is capped at 6 carbons (≈10 Å end-to-end).
 	linkableN := ps.Len()
-	nLinkers := linkProbeGroups(&ps.Pos, &ps.Labels, &ps.Bonds, heavy, 20.0, linkableN)
-	fmt.Printf("Linker chains: %d\n", nLinkers)
+	pairs := linkProbeGroups(&ps.Pos, &ps.Labels, &ps.Bonds, heavy, 14.0, linkableN)
+	fmt.Printf("Linker chains: %d\n", len(pairs))
+	tick("link probe groups")
+
+	merged := linkMoleculeGroups(pairs, heavy, 14.0)
+	fmt.Printf("Merged molecules: %d\n", len(merged))
+	pairs = append(pairs, merged...)
+	tick("link molecule groups")
+
+	// Amide variants: replace adjacent sp3 chain-C pairs with C=O / N.
+	amideGrid := newClashGrid(heavy)
+	var amidePairs []ProbeSet
+	for _, mol := range pairs {
+		amidePairs = append(amidePairs, amideVariants(mol, amideGrid)...)
+	}
+	fmt.Printf("Amide variants: %d\n", len(amidePairs))
+	pairs = append(pairs, amidePairs...)
+	tick("amide variants")
+
+	pharmPairs := pairs
+
+	// ── Ring SAR scan on linked pairs ─────────────────────────────────────────
+	var linkedRingScan []ProbeSet
+	for pi, pp := range pharmPairs {
+		variants := ScanRings(&pp, heavy)
+		for i := range variants {
+			variants[i].ParentIdx = pi
+		}
+		linkedRingScan = append(linkedRingScan, variants...)
+	}
+	fmt.Printf("Ring-substituted linked pairs: %d\n", len(linkedRingScan))
+	tick("ring scan on linked pairs")
+
+	// ── Chain heteroatom scan ─────────────────────────────────────────────────
+	chainScanned := ScanChain(pharmPairs, heavy)
+	fmt.Printf("Chain heteroatom variants: %d\n", len(chainScanned))
+	tick("chain heteroatom scan")
+
+	// ── Fragment growing ────────────────────────────────────────────────────────
+	grownPairs := GrowLinked(pharmPairs, heavy)
+	fmt.Printf("Grown variants: %d\n", len(grownPairs))
+	grownRingScan := GrowLinked(linkedRingScan, heavy)
+	fmt.Printf("Grown ring-substituted: %d\n", len(grownRingScan))
+	grownPairs = append(grownPairs, grownRingScan...)
+	tick("fragment growing")
+
+	// ── Ring closures ────────────────────────────────────────────────────────────
+	closedPairs := RingClose(pharmPairs, heavy)
+	closedPairs = append(closedPairs, RingClose(grownPairs, heavy)...)
+	fmt.Printf("Ring closures: %d\n", len(closedPairs))
+	tick("ring closures")
+
+	// ── Bidirectional growing ─────────────────────────────────────────────────
+	// NOTE: BidirGrow builds a second bridge between probe endpoints, forming a
+	// macrocycle on top of the existing linker. This only makes sense for short
+	// gaps (< 8 Å). Disabled until pre-linking architecture is implemented.
+	// bidirPairs := BidirGrow(pharmPairs, heavy)
+	bidirPairs := []ProbeSet{}
+	fmt.Printf("Bidirectional grown: %d\n", len(bidirPairs))
+
+	// selfClashFree: grown atoms must not overlap each other or scaffold.
+	selfClashFree := func(v ProbeSet, nOrigAtoms int) bool {
+		for i := nOrigAtoms; i < len(v.Pos); i++ {
+			ri := vdw(v.Labels[i])
+			for j := 0; j < i; j++ {
+				bonded := false
+				for _, b := range v.Bonds {
+					if (b.I-1 == i && b.J-1 == j) || (b.I-1 == j && b.J-1 == i) {
+						bonded = true
+						break
+					}
+				}
+				if bonded {
+					continue
+				}
+				rj := vdw(v.Labels[j])
+				if v.Pos[i].Sub(v.Pos[j]).Norm() < ri+rj-1.0 {
+					return false
+				}
+			}
+		}
+		return true
+	}
+
+	// Keep all grown variants, ring closures, ring-substituted linked pairs.
+	allVariants := append(append(append(grownPairs, closedPairs...), bidirPairs...), linkedRingScan...)
+	validVariants := make([]ProbeSet, 0, len(pharmPairs)+len(allVariants))
+	// Always include the original pharmacophoric pairs.
+	validVariants = append(validVariants, pharmPairs...)
+	// Add all grown/closed variants that pass self-clash check.
+	for _, v := range allVariants {
+		pi := v.ParentIdx
+		if pi < 0 || pi >= len(pharmPairs) {
+			continue
+		}
+		nOrig := len(pharmPairs[pi].Pos)
+		if strings.HasPrefix(v.Name, "bidir-") || selfClashFree(v, nOrig) {
+			validVariants = append(validVariants, v)
+		}
+	}
+	fmt.Printf("Total variants (all): %d\n", len(validVariants))
+	tick("self-clash filter")
+
+	// ── Deduplicate by linker RMSD ────────────────────────────────────────────
+	// Two variants with the same ParentIdx and same atom count are duplicates
+	// if the RMSD of their linker atoms (beyond nOrig scaffold atoms) is < 1.0 Å.
+	// Keep the one with fewer protein heavy-atom clashes.
+	clashCount := func(ps ProbeSet) int {
+		n := 0
+		for _, p := range ps.Pos {
+			for _, h := range heavy {
+				if p.Sub(h.pos).Norm() < h.vdwR+vdw("C")-0.8 {
+					n++
+				}
+			}
+		}
+		return n
+	}
+	linkerRMSD := func(a, b ProbeSet, start int) float64 {
+		if len(a.Pos) != len(b.Pos) || start >= len(a.Pos) {
+			return math.MaxFloat64
+		}
+		sum := 0.0
+		n := len(a.Pos) - start
+		for i := start; i < len(a.Pos); i++ {
+			d := a.Pos[i].Sub(b.Pos[i]).Norm()
+			sum += d * d
+		}
+		return math.Sqrt(sum / float64(n))
+	}
+	const rmsdThreshold = 1.0 // Å
+	keep := make([]bool, len(validVariants))
+	for i := range keep { keep[i] = true }
+	for i := 0; i < len(validVariants); i++ {
+		if !keep[i] { continue }
+		vi := validVariants[i]
+		pi := vi.ParentIdx
+		nOrig := 0
+		if pi >= 0 && pi < len(pharmPairs) { nOrig = len(pharmPairs[pi].Pos) }
+		for j := i + 1; j < len(validVariants); j++ {
+			if !keep[j] { continue }
+			vj := validVariants[j]
+			if vj.ParentIdx != pi { continue }
+			if len(vj.Pos) != len(vi.Pos) { continue }
+			if linkerRMSD(vi, vj, nOrig) < rmsdThreshold {
+				// Keep the one with fewer clashes.
+				if clashCount(vj) < clashCount(vi) {
+					keep[i] = false
+					break
+				}
+				keep[j] = false
+			}
+		}
+	}
+	deduped := validVariants[:0]
+	for i, v := range validVariants {
+		if keep[i] { deduped = append(deduped, v) }
+	}
+	nDupes := len(validVariants) - len(deduped)
+	if nDupes > 0 {
+		fmt.Printf("Deduplicated: removed %d near-identical variants (RMSD < %.1f Å)\n", nDupes, rmsdThreshold)
+	}
+	validVariants = deduped
+	tick("RMSD deduplication")
+
+	// Combine: all valid variants + standalone ring scan variants.
+	pairs = append(validVariants, ringScanPairs...)
 
 	// ── Backbone ──────────────────────────────────────────────────────────────
 	nBB := addBackbone(proteinAtoms, &ps.Pos, &ps.Labels, &ps.Bonds)
 	fmt.Printf("Backbone residues: %d\n", nBB)
 
-	// ── Write output as SDF (not .mol) ────────────────────────────────────────
+	// ── Write output ──────────────────────────────────────────────────────────
 	outPath := pdbID + "_probes.sdf"
-	if err := WriteSDF(outPath, ps); err != nil {
+	if len(pairs) == 0 && len(ringScanPairs) == 0 {
+		fmt.Fprintln(os.Stderr, "No probe pairs generated — nothing to write.")
+		os.Exit(1)
+	}
+	// Combine: pharmacophoric pairs + standalone ring scan variants (those not
+	// picked up by linking get written as-is for visual inspection).
+	allPairs := append(append(pairs, ringScanPairs...), chainScanned...)
+
+	// Fuse atoms that are within 0.7 Å of each other (overlapping ring/carbonyl atoms),
+	// then sanitize any valence overflows introduced by fusion.
+	nFused := 0
+	for i := range allPairs {
+		fused := fuseOverlapping(allPairs[i], 0.7)
+		if len(fused.Pos) < len(allPairs[i].Pos) {
+			nFused++
+		}
+		allPairs[i] = sanitizeValence(fused)
+	}
+	if nFused > 0 {
+		fmt.Printf("Fused overlapping atoms in %d molecules\n", nFused)
+	}
+	tick("fuse + sanitize valence")
+
+	// Keep only fully connected molecules.
+	// Both probe endpoints are already required to contain a ring (noRing filter
+	// in linkProbeGroups), so the ring count requirement is satisfied by
+	// construction. Grown/closed/chain-scanned variants are kept as long as they
+	// are connected.
+	var connPairs []ProbeSet
+	for _, p := range allPairs {
+		if isConnected(p) {
+			connPairs = append(connPairs, p)
+		}
+	}
+	fmt.Printf("Connected molecules: %d / %d\n", len(connPairs), len(allPairs))
+	allPairs = connPairs
+	tick("connectivity filter")
+
+	if err := WriteSDF(outPath, ps, allPairs); err != nil {
 		fmt.Fprintf(os.Stderr, "Error writing SDF: %v\n", err)
 		os.Exit(1)
 	}
-	fmt.Printf("Wrote %d probe atoms -> %s\n", ps.Len(), outPath)
+	fmt.Printf("Wrote %d probe atoms + %d linked pairs + %d ring variants -> %s\n",
+		ps.Len(), len(pairs), len(ringScanPairs), outPath)
+	tick("write SDF")
+}
+
+// sanitizeValence removes excess bonds from over-valent atoms.
+// Bonds are processed highest-order first so double bonds (C=O, C=N) are
+// preserved over single bonds when an atom is over its element maximum.
+func sanitizeValence(mol ProbeSet) ProbeSet {
+	maxVal := map[string]int{"C": 4, "N": 3, "O": 2, "S": 2, "F": 1, "CL": 1, "BR": 1}
+	n := len(mol.Pos)
+
+	type idxBond struct {
+		b   Bond
+		idx int
+	}
+	sorted := make([]idxBond, len(mol.Bonds))
+	for k, b := range mol.Bonds {
+		sorted[k] = idxBond{b, k}
+	}
+	// Process highest-order bonds first so they are reserved for valence budget.
+	sort.Slice(sorted, func(i, j int) bool {
+		return sorted[i].b.Order > sorted[j].b.Order
+	})
+
+	used := make([]int, n) // accumulated bond-order sum per atom
+	keep := make([]bool, len(mol.Bonds))
+	for _, ib := range sorted {
+		b := ib.b
+		i, j := b.I-1, b.J-1
+		if i < 0 || j < 0 || i >= n || j >= n {
+			continue
+		}
+		ord := b.Order
+		if ord == 4 {
+			ord = 2 // aromatic bond consumes 2 of each atom's valence budget
+		}
+		elI := strings.ToUpper(mol.Labels[i])
+		elJ := strings.ToUpper(mol.Labels[j])
+		mvI, okI := maxVal[elI]
+		if !okI {
+			mvI = 4
+		}
+		mvJ, okJ := maxVal[elJ]
+		if !okJ {
+			mvJ = 4
+		}
+		if used[i]+ord <= mvI && used[j]+ord <= mvJ {
+			used[i] += ord
+			used[j] += ord
+			keep[ib.idx] = true
+		}
+	}
+
+	result := ProbeSet{Name: mol.Name, ParentIdx: mol.ParentIdx}
+	for k, p := range mol.Pos {
+		result.Add(p, mol.Labels[k])
+	}
+	for k, b := range mol.Bonds {
+		if keep[k] {
+			result.Bond(b.I, b.J, b.Order)
+		}
+	}
+	return result
+}
+
+// fuseOverlapping merges atom pairs within thresh Å into a single atom, redirecting
+// all bonds to the surviving atom. This produces fused ring systems and
+// ring–carbonyl fusions from molecules whose atoms were placed at overlapping positions.
+func fuseOverlapping(mol ProbeSet, thresh float64) ProbeSet {
+	n := len(mol.Pos)
+	parent := make([]int, n)
+	for i := range parent {
+		parent[i] = i
+	}
+	var find func(int) int
+	find = func(x int) int {
+		if parent[x] != x {
+			parent[x] = find(parent[x])
+		}
+		return parent[x]
+	}
+	for i := 0; i < n; i++ {
+		for j := i + 1; j < n; j++ {
+			if mol.Pos[i].Sub(mol.Pos[j]).Norm() < thresh {
+				pi, pj := find(i), find(j)
+				if pi != pj {
+					parent[pi] = pj
+				}
+			}
+		}
+	}
+
+	// Map each atom to its canonical new index.
+	newIdx := make([]int, n)
+	repr := map[int]int{}
+	count := 0
+	for i := 0; i < n; i++ {
+		r := find(i)
+		if _, ok := repr[r]; !ok {
+			repr[r] = count
+			count++
+		}
+		newIdx[i] = repr[r]
+	}
+
+	// Build new atom list using the first atom seen for each group.
+	result := ProbeSet{Name: mol.Name, ParentIdx: mol.ParentIdx}
+	added := make([]bool, count)
+	for i := 0; i < n; i++ {
+		ni := newIdx[i]
+		if !added[ni] {
+			result.Add(mol.Pos[i], mol.Labels[i])
+			added[ni] = true
+		}
+	}
+
+	// Remap bonds; drop self-loops from fusion; keep max order for duplicates.
+	type bkey struct{ i, j int }
+	best := map[bkey]int{}
+	for _, b := range mol.Bonds {
+		ni := newIdx[b.I-1] + 1
+		nj := newIdx[b.J-1] + 1
+		if ni == nj {
+			continue
+		}
+		k := bkey{ni, nj}
+		if ni > nj {
+			k = bkey{nj, ni}
+		}
+		if b.Order > best[k] {
+			best[k] = b.Order
+		}
+	}
+	for k, ord := range best {
+		result.Bond(k.i, k.j, ord)
+	}
+	return result
+}
+
+// isConnected returns true if all atoms in mol are reachable from atom 0 via bonds.
+func isConnected(mol ProbeSet) bool {
+	n := len(mol.Pos)
+	if n <= 1 {
+		return true
+	}
+	adj := make([][]int, n)
+	for _, b := range mol.Bonds {
+		i, j := b.I-1, b.J-1
+		if i < 0 || j < 0 || i >= n || j >= n {
+			continue
+		}
+		adj[i] = append(adj[i], j)
+		adj[j] = append(adj[j], i)
+	}
+	visited := make([]bool, n)
+	queue := []int{0}
+	visited[0] = true
+	count := 1
+	for len(queue) > 0 {
+		cur := queue[0]
+		queue = queue[1:]
+		for _, nb := range adj[cur] {
+			if !visited[nb] {
+				visited[nb] = true
+				count++
+				queue = append(queue, nb)
+			}
+		}
+	}
+	return count == n
 }
 
 // ── Hydrophobic alkane chain ──────────────────────────────────────────────────
@@ -473,16 +928,14 @@ func buildAromaticProbes(proteinAtoms []Atom, heavy []heavyAtom, ps *ProbeSet) {
 			for _, e := range edges {
 				ps.Bond(base+e[0], base+e[1], 4)
 			}
-			// Methyl cap on ring atom 3 (opposite atom 0), pointing away from
-			// the source ring centroid so the cap faces into solvent.
-			capDir := ringPts[3].Sub(centroid)
-			if capDir.Norm() < 1e-6 {
-				capDir = norm
-			}
-			capPos := ringPts[3].Add(capDir.unit().Scale(1.54))
+			// Methyl cap on ring atom 3 (para position), placed IN the ring
+			// plane by using the radial direction from the probe ring centre.
+			// This ensures the cap C is coplanar with the benzene ring.
+			capDir := ringPts[3].Sub(centre).unit()
+			capPos := ringPts[3].Add(capDir.Scale(1.54))
 			capIdx := ps.Len() + 1
 			ps.Add(capPos, "C")
-			ps.Bond(base+3, capIdx, 1) // ring C – methyl cap
+			ps.Bond(base+3, capIdx, 1) // ring C – methyl cap (in-plane)
 			return true
 		}
 
