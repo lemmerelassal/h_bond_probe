@@ -135,6 +135,138 @@ func placeArgAcids(atoms []Atom, placedPos *[]Vec3, placedLabel *[]string, bonds
 }
 
 
+// tetrazoleRing builds a planar tetrazolate ring (a carboxylate bioisostere)
+// approaching a cationic residue atom.  The ring carbon C5 carries the linker
+// (a stem carbon), so both point away from the cation (+zHat); the four ring
+// nitrogens face the cation (−zHat) to make the salt-bridge / bidentate H-bond,
+// exactly mirroring how the carboxylate oxygens engage.
+//
+//   anchor — residue atom the ring approaches (ARG CZ or LYS NZ)
+//   zHat   — approach axis pointing from the residue outward toward the probe
+//   xHat   — in-plane spread axis (rotated during the clash search)
+//
+// Returns the six atom positions in the order
+//   [C5, N1, N2, N3, N4, stemC]
+// with ring connectivity C5–N1–N2–N3–N4–C5 and stemC bonded to C5.
+func tetrazoleRing(anchor, zHat, xHat Vec3) [6]Vec3 {
+	const (
+		ringR   = 1.13 // pentagon circumradius (side ≈ 1.33 Å)
+		centerD = 4.30 // ring-centre distance from anchor along zHat
+		stemLen = 1.47 // C5–stem(C) bond length
+	)
+	center := anchor.Add(zHat.Scale(centerD))
+	// Regular pentagon, C5 apex at +zHat (away from cation); going round by 72°
+	// gives N1..N4 so that C5 is bonded to both N1 (72°) and N4 (288°).
+	vert := func(angDeg float64) Vec3 {
+		a := angDeg * math.Pi / 180
+		return center.Add(zHat.Scale(ringR * math.Cos(a))).Add(xHat.Scale(ringR * math.Sin(a)))
+	}
+	c5 := vert(0)
+	stem := c5.Add(zHat.Scale(stemLen)) // exocyclic, continues outward from apex
+	return [6]Vec3{c5, vert(72), vert(144), vert(216), vert(288), stem}
+}
+
+// appendTetrazole writes a tetrazolate ring (positions from tetrazoleRing) into
+// the probe arrays using a Kekulé bond pattern that keeps every atom within its
+// valence (so sanitizeValence never strips a ring bond).
+func appendTetrazole(placedPos *[]Vec3, placedLabel *[]string, bonds *[]Bond, ring [6]Vec3) {
+	base := len(*placedPos) + 1
+	*placedPos = append(*placedPos, ring[0], ring[1], ring[2], ring[3], ring[4], ring[5])
+	*placedLabel = append(*placedLabel, "C", "N", "N", "N", "N", "C")
+	*bonds = append(*bonds,
+		Bond{base, base + 1, 1},     // C5–N1 single
+		Bond{base + 1, base + 2, 1}, // N1–N2 single
+		Bond{base + 2, base + 3, 2}, // N2=N3 double
+		Bond{base + 3, base + 4, 1}, // N3–N4 single
+		Bond{base + 4, base, 2},     // N4=C5 double
+		Bond{base, base + 5, 1},     // C5–stem single (linker handle)
+	)
+}
+
+// placeArgTetrazoles places a tetrazolate near each ARG guanidinium as a
+// carboxylate bioisostere — same anchor atoms and approach frame as
+// placeArgAcids, but a CN4 ring instead of COO⁻.  Generated in addition to the
+// acid so both pharmacophores are explored.  Returns the number placed.
+func placeArgTetrazoles(atoms []Atom, placedPos *[]Vec3, placedLabel *[]string, bonds *[]Bond) int {
+	type guanGroup struct {
+		NE, CZ, NH1, NH2 Vec3
+		found            [4]bool
+	}
+	groups := map[residueKey]*guanGroup{}
+	for _, a := range atoms {
+		if strings.TrimSpace(strings.ToUpper(a.ResName)) != "ARG" {
+			continue
+		}
+		key := residueKey{a.ChainID, a.ResSeq}
+		if groups[key] == nil {
+			groups[key] = &guanGroup{}
+		}
+		g := groups[key]
+		switch strings.TrimSpace(strings.ToUpper(a.Name)) {
+		case "NE":
+			g.NE, g.found[0] = a.Pos, true
+		case "CZ":
+			g.CZ, g.found[1] = a.Pos, true
+		case "NH1":
+			g.NH1, g.found[2] = a.Pos, true
+		case "NH2":
+			g.NH2, g.found[3] = a.Pos, true
+		}
+	}
+
+	clash := newResClashSet(atoms)
+
+	placed := 0
+	for _, key := range sortedResidueKeys(groups) {
+		g := groups[key]
+		if !g.found[0] || !g.found[1] || !g.found[2] || !g.found[3] {
+			continue
+		}
+
+		// Local frame: Z along NE→CZ (approach direction), X in-plane toward NH1.
+		zHat := g.CZ.Sub(g.NE).unit()
+		nh1Perp := g.NH1.Sub(g.CZ)
+		nh1Perp = nh1Perp.Sub(zHat.Scale(nh1Perp.Dot(zHat)))
+		baseX := func() Vec3 {
+			if nh1Perp.Norm() < 0.1 {
+				return perpendicular(zHat)
+			}
+			yH := cross3(zHat, nh1Perp).unit()
+			return cross3(yH, zHat).unit()
+		}()
+
+		var ring [6]Vec3
+		found := false
+		for step := 0; step < 12 && !found; step++ {
+			theta := float64(step) * math.Pi / 6
+			yHat := cross3(zHat, baseX)
+			rx := baseX.Scale(math.Cos(theta)).Add(yHat.Scale(math.Sin(theta)))
+			r := tetrazoleRing(g.CZ, zHat, rx)
+			ok := true
+			for i, p := range r {
+				elem := "N"
+				if i == 0 || i == 5 {
+					elem = "C"
+				}
+				if !clash.clears(p, elem, key) {
+					ok = false
+					break
+				}
+			}
+			if ok {
+				ring, found = r, true
+			}
+		}
+		if !found {
+			continue
+		}
+		appendTetrazole(placedPos, placedLabel, bonds, ring)
+		placed++
+	}
+	return placed
+}
+
+
 // placeCarboxylateGuanidines places a guanidine molecule near each ASP or GLU
 // carboxylate using bidentate H-bond geometry (N···O ≈ 2.9 Å to both oxygens).
 //
@@ -761,6 +893,78 @@ func placeLysAcetates(atoms []Atom, placedPos *[]Vec3, placedLabel *[]string, bo
 }
 
 
+// placeLysTetrazoles places a tetrazolate near each LYS ammonium as a
+// carboxylate bioisostere — same anchor (NZ) and approach axis as
+// placeLysAcetates, but a CN4 ring instead of COO⁻.  Generated in addition to
+// the acetate.  Returns the number placed.
+func placeLysTetrazoles(atoms []Atom, placedPos *[]Vec3, placedLabel *[]string, bonds *[]Bond) int {
+	type lys struct {
+		CE, NZ Vec3
+		found  [2]bool
+	}
+	groups := map[residueKey]*lys{}
+
+	for _, a := range atoms {
+		if strings.TrimSpace(strings.ToUpper(a.ResName)) != "LYS" {
+			continue
+		}
+		key := residueKey{a.ChainID, a.ResSeq}
+		if groups[key] == nil {
+			groups[key] = &lys{}
+		}
+		g := groups[key]
+		switch strings.TrimSpace(strings.ToUpper(a.Name)) {
+		case "CE":
+			g.CE, g.found[0] = a.Pos, true
+		case "NZ":
+			g.NZ, g.found[1] = a.Pos, true
+		}
+	}
+
+	clash := newResClashSet(atoms)
+
+	placed := 0
+	for _, key := range sortedResidueKeys(groups) {
+		g := groups[key]
+		if !g.found[0] || !g.found[1] {
+			continue
+		}
+
+		zHat := g.NZ.Sub(g.CE).unit()
+		baseX := perpendicular(zHat)
+
+		var ring [6]Vec3
+		found := false
+		for step := 0; step < 12 && !found; step++ {
+			theta := float64(step) * math.Pi / 6
+			yHat := cross3(zHat, baseX)
+			rx := baseX.Scale(math.Cos(theta)).Add(yHat.Scale(math.Sin(theta)))
+			r := tetrazoleRing(g.NZ, zHat, rx)
+			ok := true
+			for i, p := range r {
+				elem := "N"
+				if i == 0 || i == 5 {
+					elem = "C"
+				}
+				if !clash.clears(p, elem, key) {
+					ok = false
+					break
+				}
+			}
+			if ok {
+				ring, found = r, true
+			}
+		}
+		if !found {
+			continue
+		}
+		appendTetrazole(placedPos, placedLabel, bonds, ring)
+		placed++
+	}
+	return placed
+}
+
+
 // placeCysMethanethiols places a methanethiol probe (C–SH) near each CYS SG,
 // capturing the thiol donor/acceptor pharmacophore.
 //
@@ -1030,86 +1234,144 @@ func placeWaterMethanols(atoms []Atom, placedPos *[]Vec3, placedLabel *[]string,
 // beam search. startIncoming is the unit vector of the bond arriving AT start
 // (direction from start's predecessor toward start). Returns intermediate atom
 // positions between start and end (exclusive), or nil if no path is found.
-func buildChainPath(start, end Vec3, startIncoming Vec3, maxAtoms int, grid *clashGrid) []Vec3 {
+// buildLinkerChain builds an all-sp3 carbon linker joining two probe atoms at p1
+// and p2 whose open-valence (exit) directions are dir1 and dir2. It returns the
+// full list of chain atom positions INCLUDING the two end-cap atoms
+//
+//	c0   = p1 + dir1*1.54     (bonds p1)
+//	cEnd = p2 + dir2*1.54     (bonds p2)
+//
+// such that the bond angle is tetrahedral (~109.5°) at p1, at p2, and at every
+// chain atom — including the two end junctions, which the previous planar-zigzag
+// builder left uncontrolled (the cause of the 30–70° junctions that the geometry
+// gate then discarded). Returns nil if no clash-free chain of ≤ maxInter interior
+// atoms can close the gap.
+//
+// Construction: a beam search grows a tetrahedral chain from c0 with the correct
+// outgoing tangent (forward·forward = +1/3 ⇒ 109.5° bond angle), and a candidate
+// is accepted only when its closing bond to cEnd is tetrahedral at BOTH ends.
+func buildLinkerChain(p1, dir1, p2, dir2 Vec3, grid *clashGrid, maxInter int) []Vec3 {
 	const (
-		bondLen   = 1.54
-		cosT      = -0.333 // cos(109.5°)
-		sinT      = 0.9428
-		beamWidth = 16
-		nRot      = 12 // rotation steps around tetrahedral cone
-		minBond   = 1.30
-		maxBond   = 1.65
+		bondLen = 1.54
+		cosFwd  = 1.0 / 3.0 // forward·forward dot giving a 109.5° bond angle
+		sinFwd  = 0.9428
+		minBond = 1.30
+		maxBond = 1.65
+		beamW   = 40
+		nRot    = 12
+		angLo   = 95.0  // accept junction angles in [95°,130°]: clear of the 82°
+		angHi   = 130.0 // geometry floor and centred on the tetrahedral 109.5°
 	)
+	deg := func(a, b Vec3) float64 {
+		na, nb := a.Norm(), b.Norm()
+		if na < 1e-9 || nb < 1e-9 {
+			return 180
+		}
+		c := a.Dot(b) / (na * nb)
+		if c > 1 {
+			c = 1
+		} else if c < -1 {
+			c = -1
+		}
+		return 180 / math.Pi * math.Acos(c)
+	}
+	c0 := p1.Add(dir1.Scale(bondLen))
+	cEnd := p2.Add(dir2.Scale(bondLen))
+	if !grid.clashFree(c0, vdw("C"), hardTol) || !grid.clashFree(cEnd, vdw("C"), hardTol) {
+		return nil
+	}
+	angOK := func(a float64) bool { return a >= angLo && a <= angHi }
 
-	cfp := func(pos Vec3, chain []Vec3) bool {
-		if !grid.clashFree(pos, vdw("C"), hardTol) {
+	// Direct cap-to-cap bond (no interior atoms).
+	if L := c0.Sub(cEnd).Norm(); L >= minBond && L <= maxBond {
+		if angOK(deg(p1.Sub(c0), cEnd.Sub(c0))) && angOK(deg(p2.Sub(cEnd), c0.Sub(cEnd))) {
+			return []Vec3{c0, cEnd}
+		}
+	}
+
+	// closeOK: penultimate atom `pen` (predecessor penPrev) may bond cEnd if that
+	// closing bond is tetrahedral at both pen and cEnd.
+	closeOK := func(penPrev, pen Vec3) bool {
+		if L := pen.Sub(cEnd).Norm(); L < minBond || L > maxBond {
 			return false
 		}
-		r := vdw("C")
-		for _, ep := range chain {
-			if pos.Sub(ep).Norm() < r+r-1.0 {
-				return false
-			}
+		return angOK(deg(penPrev.Sub(pen), cEnd.Sub(pen))) &&
+			angOK(deg(pen.Sub(cEnd), p2.Sub(cEnd)))
+	}
+
+	// Aim the search at the ideal penultimate-atom position, not at cEnd itself: the
+	// penultimate atom should sit at a tetrahedral angle off the cEnd→p2 bond so the
+	// chain approaches cEnd from the side (a head-on approach gives a ~180° exit
+	// junction, which a pure distance-to-cEnd metric would otherwise drive toward —
+	// the failure on near-collinear linkers). Two mirror targets cover both sides.
+	toP2 := p2.Sub(cEnd)
+	if toP2.Norm() < 1e-9 {
+		toP2 = dir2.Scale(-1)
+	}
+	toP2 = toP2.unit()
+	nrm := cross3(toP2, cEnd.Sub(c0))
+	if nrm.Norm() < 1e-6 {
+		nrm = perpendicular(toP2)
+	}
+	nrm = nrm.unit()
+	tang := cross3(nrm, toP2)
+	preA := cEnd.Add(toP2.Scale(-1.0 / 3.0).Add(tang.Scale(sinFwd)).Scale(bondLen))
+	preB := cEnd.Add(toP2.Scale(-1.0 / 3.0).Sub(tang.Scale(sinFwd)).Scale(bondLen))
+	target := func(v Vec3) float64 {
+		da, db := v.Sub(preA).Norm(), v.Sub(preB).Norm()
+		if da < db {
+			return da
 		}
-		return true
+		return db
 	}
 
 	type node struct {
-		chain []Vec3 // atoms placed so far, chain[0] = start
-		dir   Vec3   // incoming bond direction at chain[last]
+		chain []Vec3 // c0 .. last placed atom
+		dir   Vec3   // forward bond direction into the last atom
 		dist  float64
 	}
-
-	beam := []node{{
-		chain: []Vec3{start},
-		dir:   startIncoming,
-		dist:  start.Sub(end).Norm(),
-	}}
-
-	for depth := 0; depth < maxAtoms; depth++ {
+	beam := []node{{[]Vec3{c0}, dir1, target(c0)}}
+	for depth := 0; depth < maxInter; depth++ {
 		var next []node
 		for _, cur := range beam {
 			pos := cur.chain[len(cur.chain)-1]
-			basePerp := perpendicular(cur.dir)
-			perp2 := cross3(cur.dir, basePerp).unit()
-
+			bp := perpendicular(cur.dir)
+			q := cross3(cur.dir, bp).unit()
 			for oi := 0; oi < nRot; oi++ {
 				ang := float64(oi) * 2 * math.Pi / float64(nRot)
-				p := basePerp.Scale(math.Cos(ang)).Add(perp2.Scale(math.Sin(ang)))
-				dir := cur.dir.Scale(cosT).Add(p.Scale(sinT)).unit()
-				np := pos.Add(dir.Scale(bondLen))
-
-				if !cfp(np, cur.chain) {
+				p := bp.Scale(math.Cos(ang)).Add(q.Scale(math.Sin(ang)))
+				d := cur.dir.Scale(cosFwd).Add(p.Scale(sinFwd)).unit()
+				np := pos.Add(d.Scale(bondLen))
+				if !grid.clashFree(np, vdw("C"), hardTol) {
 					continue
 				}
-				d := np.Sub(end).Norm()
-				if d < minBond {
-					continue // overshot
+				selfClash := false
+				for i := 0; i < len(cur.chain)-1; i++ { // skip immediate predecessor
+					if np.Sub(cur.chain[i]).Norm() < 2*vdw("C")-1.0 {
+						selfClash = true
+						break
+					}
 				}
-				if d <= maxBond {
-					// Reached end — return intermediates (exclude start).
-					result := make([]Vec3, len(cur.chain)-1+1)
-					copy(result, cur.chain[1:])
-					result[len(result)-1] = np
-					return result
-				}
-				// Prune nodes that can't possibly reach end in remaining steps.
-				remaining := maxAtoms - depth - 1
-				if d > float64(remaining)*bondLen*1.3+maxBond {
+				if selfClash {
 					continue
 				}
-				nc := make([]Vec3, len(cur.chain)+1)
-				copy(nc, cur.chain)
-				nc[len(cur.chain)] = np
-				next = append(next, node{chain: nc, dir: dir, dist: d})
+				if closeOK(pos, np) {
+					return append(append([]Vec3{}, cur.chain...), np, cEnd)
+				}
+				dd := target(np)
+				if remaining := maxInter - depth - 1; dd > float64(remaining)*bondLen*1.3+maxBond {
+					continue
+				}
+				nc := append(append([]Vec3{}, cur.chain...), np)
+				next = append(next, node{nc, d, dd})
 			}
 		}
 		if len(next) == 0 {
-			return nil
+			break
 		}
 		sort.Slice(next, func(i, j int) bool { return next[i].dist < next[j].dist })
-		if len(next) > beamWidth {
-			next = next[:beamWidth]
+		if len(next) > beamW {
+			next = next[:beamW]
 		}
 		beam = next
 	}
@@ -1214,12 +1476,36 @@ func linkProbeGroups(placedPos *[]Vec3, placedLabel *[]string, bonds *[]Bond,
 		}
 	}
 
-	// ── Build candidate pairs: nearest atom between every qualifying component pair ──
-	// For each (c1, c2), find the atom pair (i ∈ c1, j ∈ c2) with the smallest
-	// distance. Any atom can be a connection point.
+	// ── Attachment-atom eligibility & preference ─────────────────────────────
+	// A linker may only attach to an atom that still has spare valence; otherwise
+	// sanitizeValence would later strip a bond to rebalance it — e.g. removing a
+	// tetrazole/aromatic ring bond and breaking the ring.  Among eligible atoms
+	// we prefer non-ring carbons (the stem/methyl/chain "handles") so ring
+	// systems stay intact and H-bonding heteroatoms stay unblocked.
+	valence := atomValences(n, *bonds)
+	inCore := ringCoreAtoms(adj)
+	// attachPenalty returns a preference penalty (lower = better) and whether the
+	// atom is eligible at all (has spare valence for one more single bond).
+	attachPenalty := func(idx int) (float64, bool) {
+		if valence[idx]+1 > maxValence(labels[idx]) {
+			return 0, false
+		}
+		pen := 0.0
+		if strings.ToUpper(labels[idx]) != "C" {
+			pen += 1.0 // prefer carbon over heteroatom (keep donors/acceptors free)
+		}
+		if inCore[idx] {
+			pen += 1.5 // prefer non-ring atoms (keep rings intact)
+		}
+		return pen, true
+	}
+
+	// ── Build candidate pairs: best eligible atom between every qualifying pair ──
+	// For each (c1, c2) pick the atom pair minimising distance + attachment
+	// penalty, considering only atoms that have spare valence.
 	type cpair struct {
 		c1, c2 int
-		t1, t2 int     // nearest atoms (one per component)
+		t1, t2 int     // chosen attachment atoms (one per component)
 		d      float64
 	}
 	var pairs []cpair
@@ -1231,24 +1517,37 @@ func linkProbeGroups(placedPos *[]Vec3, placedLabel *[]string, bonds *[]Bond,
 			if !compOK[c2] {
 				continue
 			}
+			bestCost := math.MaxFloat64
 			bestD := math.MaxFloat64
 			bestI, bestJ := -1, -1
 			for i := 0; i < linkableN; i++ {
 				if comp[i] != c1 {
 					continue
 				}
+				pi, oki := attachPenalty(i)
+				if !oki {
+					continue
+				}
 				for j := 0; j < linkableN; j++ {
 					if comp[j] != c2 {
 						continue
 					}
+					pj, okj := attachPenalty(j)
+					if !okj {
+						continue
+					}
 					d := positions[i].Sub(positions[j]).Norm()
-					if d < bestD {
+					if d < 2.0 || d > maxDist {
+						continue
+					}
+					if cost := d + pi + pj; cost < bestCost {
+						bestCost = cost
 						bestD = d
 						bestI, bestJ = i, j
 					}
 				}
 			}
-			if bestI >= 0 && bestD >= 2.0 && bestD <= maxDist {
+			if bestI >= 0 {
 				pairs = append(pairs, cpair{c1, c2, bestI, bestJ, bestD})
 			}
 		}
@@ -1307,26 +1606,15 @@ func linkProbeGroups(placedPos *[]Vec3, placedLabel *[]string, bonds *[]Bond,
 				break
 			}
 		}
-		if len(nbs) >= 2 && isSp2 {
-			// sp2: exocyclic bond bisects the external angle of the two ring bonds.
-			sum := Vec3{}
-			for _, nb := range nbs {
-				sum = sum.Add(positions[nb].Sub(pos1).unit())
+		// Choose the open-valence direction (respecting existing bonds for every
+		// neighbour count) that best aligns with the chain axis toward a2.
+		{
+			nbPos := make([]Vec3, len(nbs))
+			for k, nb := range nbs {
+				nbPos[k] = positions[nb]
 			}
-			if sum.Norm() > 1e-6 {
-				firstAtomDir = sum.Scale(-1).unit()
-			}
-		} else if len(nbs) == 1 {
-			// sp3: 109.5° tetrahedral cone, pick direction closest to axis.
-			incoming := pos1.Sub(positions[nbs[0]]).unit()
-			baseP := perpendicular(incoming)
-			p2vec := cross3(incoming, baseP)
-			const cosT, sinT = -0.333, 0.9428
 			bestDot := -2.0
-			for oi := 0; oi < 12; oi++ {
-				ang := float64(oi) * math.Pi / 6
-				perp := baseP.Scale(math.Cos(ang)).Add(p2vec.Scale(math.Sin(ang)))
-				dir := incoming.Scale(cosT).Add(perp.Scale(sinT)).unit()
+			for _, dir := range openValenceDirs(pos1, nbPos, isSp2) {
 				if dir.Dot(axis) > bestDot {
 					bestDot = dir.Dot(axis)
 					firstAtomDir = dir
@@ -1350,287 +1638,36 @@ func linkProbeGroups(placedPos *[]Vec3, placedLabel *[]string, bonds *[]Bond,
 				break
 			}
 		}
-		if len(nbsA2) >= 2 && isSp2A2 {
-			sum2 := Vec3{}
-			for _, nb := range nbsA2 {
-				sum2 = sum2.Add(positions[nb].Sub(pos2).unit())
+		{
+			target := axis.Scale(-1) // a2's linker bond points back toward pos1
+			nbPos := make([]Vec3, len(nbsA2))
+			for k, nb := range nbsA2 {
+				nbPos[k] = positions[nb]
 			}
-			if sum2.Norm() > 1e-6 {
-				lastAtomDir = sum2.Scale(-1).unit()
-			}
-		} else if len(nbsA2) == 1 {
-			incoming2 := pos2.Sub(positions[nbsA2[0]]).unit()
-			baseP2 := perpendicular(incoming2)
-			p2vec2 := cross3(incoming2, baseP2)
-			const cosT2, sinT2 = -0.333, 0.9428
-			bestDot2 := -2.0
-			for oi := 0; oi < 12; oi++ {
-				ang := float64(oi) * math.Pi / 6
-				perp2dir := baseP2.Scale(math.Cos(ang)).Add(p2vec2.Scale(math.Sin(ang)))
-				dir := incoming2.Scale(cosT2).Add(perp2dir.Scale(sinT2)).unit()
-				if dir.Dot(axis.Scale(-1)) > bestDot2 {
-					bestDot2 = dir.Dot(axis.Scale(-1))
+			bestDot := -2.0
+			for _, dir := range openValenceDirs(pos2, nbPos, isSp2A2) {
+				if dir.Dot(target) > bestDot {
+					bestDot = dir.Dot(target)
 					lastAtomDir = dir
 				}
 			}
 		}
 		lastAtomPos := pos2.Add(lastAtomDir.Scale(1.54))
 
-		const (
-			bondLen = 1.54
-			cosA    = 0.8165
-			sinA    = 0.578
-		)
-		// Remaining distance from firstAtomPos to lastAtomPos (both end-caps excluded).
-		remDist := firstAtomPos.Sub(lastAtomPos).Norm()
-		nBase := int(math.Round(remDist/1.258)) - 1
-		if nBase < 0 { nBase = 0 }
-		nInter := nBase
-		if nInter == 0 && remDist > 1.60 { nInter = 1 }
-
-		remAxis := lastAtomPos.Sub(firstAtomPos).unit()
-
-		basePerp := func() Vec3 {
-			// Anti-periplanar to the firstAtomDir in the remAxis plane.
-			away := firstAtomDir.Sub(remAxis.Scale(firstAtomDir.Dot(remAxis)))
-			if away.Norm() > 0.1 { return away.Scale(-1).unit() }
-			return perpendicular(remAxis)
-		}()
-		perp2 := cross3(remAxis, basePerp).unit()
-
-		// Build the chain from firstAtomPos to lastAtomPos.
-		buildZigzag := func(n int, perpV Vec3) ([]Vec3, float64) {
-			if n == 0 {
-				return nil, firstAtomPos.Sub(lastAtomPos).Norm()
-			}
-			type pt2 struct{ u, v float64 }
-			local := make([]pt2, n+2)
-			for k := 1; k <= n+1; k++ {
-				sign := 1.0
-				if (k-1)%2 == 1 { sign = -1 }
-				local[k] = pt2{local[k-1].u + cosA*bondLen, local[k-1].v + sign*sinA*bondLen}
-			}
-			eu, ev := local[n+1].u, local[n+1].v
-			idealLen := math.Sqrt(eu*eu + ev*ev)
-			d := remDist
-			s := d / idealLen
-			cosθ := eu / idealLen
-			sinθ := ev / idealLen
-			pts := make([]Vec3, n)
-			for k := 1; k <= n; k++ {
-				u, v := local[k].u, local[k].v
-				ru := (u*cosθ + v*sinθ) * s
-				rv := (-u*sinθ + v*cosθ) * s
-				pts[k-1] = firstAtomPos.Add(remAxis.Scale(ru)).Add(perpV.Scale(rv))
-			}
-			last := pts[n-1]
-			return pts, last.Sub(lastAtomPos).Norm()
-		}
-
-		// estNInter returns the distance from the last chain atom to pos2.
-		estNInter := func(n int, perpV Vec3) float64 {
-			_, d := buildZigzag(n, perpV)
-			return d
-		}
-		// sRatio returns the scale factor s=d/idealLen for n intermediate atoms.
-		// Outside [0.85, 1.15] the bond lengths and angles become unacceptable.
-		sRatio := func(n int) float64 {
-			type pt2 struct{ u, v float64 }
-			local := make([]pt2, n+2)
-			for k := 1; k <= n+1; k++ {
-				sign := 1.0
-				if (k-1)%2 == 1 {
-					sign = -1
-				}
-				local[k] = pt2{local[k-1].u + cosA*bondLen, local[k-1].v + sign*sinA*bondLen}
-			}
-			eu, ev := local[n+1].u, local[n+1].v
-			idealLen := math.Sqrt(eu*eu + ev*ev)
-			return remDist / idealLen
-		}
-
-		// Pre-check: search nBase±3 × 36 orientations, respecting the 6-carbon cap.
-		anyValid := false
-		for tryN := nInter - 3; tryN <= nInter+3 && !anyValid; tryN++ {
-			if tryN < 0 || tryN > 9 {
-				continue
-			}
-			s := sRatio(tryN)
-			if s < 0.85 || s > 1.15 {
-				continue
-			}
-			for oi := 0; oi < 36 && !anyValid; oi++ {
-				ang := float64(oi) * math.Pi / 18
-				tp := basePerp.Scale(math.Cos(ang)).Add(perp2.Scale(math.Sin(ang)))
-				d := estNInter(tryN, tp)
-				if d >= 1.3 && d <= 1.65 {
-					anyValid = true
-					nInter = tryN
-				}
-			}
-		}
-		if !anyValid {
+		// Build a saturated linker as a fully tetrahedral chain that meets both
+		// probe atoms at ~109.5°, respecting the entry/exit tangents firstAtomDir /
+		// lastAtomDir. buildLinkerChain returns the whole chain INCLUDING the two
+		// end-cap atoms (== firstAtomPos / lastAtomPos), with every junction angle
+		// controlled — fixing the old zigzag's strained end junctions.
+		fullChain := buildLinkerChain(pos1, firstAtomDir, pos2, lastAtomDir, grid, 9)
+		if fullChain == nil {
 			return
 		}
-
-		clashPts := func(pts []Vec3) int {
-			n := 0
-			for _, pt := range pts {
-				if !grid.clashFree(pt, vdw("C"), hardTol) {
-					n++
-				}
-			}
-			return n
-		}
-
-		// Compute junction torsion deviations from 180° at both chain endpoints.
-		junctionTorsionDev := func(pts []Vec3) float64 {
-			torsionDeg := func(p1, p2, p3, p4 Vec3) float64 {
-				b1 := p2.Sub(p1)
-				b2 := p3.Sub(p2)
-				b3 := p4.Sub(p3)
-				n1 := cross3(b1, b2)
-				n2 := cross3(b2, b3)
-				if n1.Norm() < 1e-6 || n2.Norm() < 1e-6 {
-					return 0
-				}
-				c := n1.Dot(n2) / (n1.Norm() * n2.Norm())
-				if c > 1 {
-					c = 1
-				}
-				if c < -1 {
-					c = -1
-				}
-				t := 180 / math.Pi * math.Acos(c)
-				if cross3(n1, n2).Dot(b2) < 0 {
-					t = -t
-				}
-				return t
-			}
-			maxDev := 0.0
-			// a1 junction: predecessor(a1) → a1 → pts[0] → pts[1]
-			if len(pts) >= 2 && len(adj[a1]) > 0 {
-				pred := positions[adj[a1][0]]
-				t := torsionDeg(pred, pos1, pts[0], pts[1])
-				dev := math.Abs(math.Abs(t) - 180)
-				if dev > maxDev {
-					maxDev = dev
-				}
-			}
-			// a2 junction: pts[-2] → pts[-1] → a2 → successor(a2)
-			n := len(pts)
-			if n >= 2 && len(adj[a2]) > 0 {
-				t := torsionDeg(pts[n-2], pts[n-1], pos2, positions[adj[a2][0]])
-				dev := math.Abs(math.Abs(t) - 180)
-				if dev > maxDev {
-					maxDev = dev
-				}
-			}
-			return maxDev
-		}
-
-		// burialScore counts how many chain atoms have ≥4 protein neighbours
-		// within 6 Å — higher = more buried in pocket, better linker path.
-		burialScore := func(pts []Vec3) int {
-			score := 0
-			for _, pt := range pts {
-				if grid.countNearby(pt, 2.0, 6.0) >= 4 {
-					score++
-				}
-			}
-			return score
-		}
-
-		bestPts := []Vec3(nil)
-		bestClash := math.MaxInt32
-		bestFinalDev := math.MaxFloat64
-		bestTorDev := math.MaxFloat64
-		bestBurial := -1
-		bestNInter := nInter
-
-		for _, tryN := range []int{nInter - 3, nInter - 2, nInter - 1, nInter, nInter + 1, nInter + 2, nInter + 3} {
-			if tryN < 0 || tryN > 9 { // max 10 chain atoms (1 entry + 9 zigzag)
-				continue
-			}
-			// Skip if the scale factor would distort bond geometry too much.
-			s := sRatio(tryN)
-			if s < 0.85 || s > 1.15 {
-				continue
-			}
-			for oi := 0; oi < 36; oi++ {
-				ang := float64(oi) * math.Pi / 18 // 10° steps
-				perp := basePerp.Scale(math.Cos(ang)).Add(perp2.Scale(math.Sin(ang)))
-				pts, finalDist := buildZigzag(tryN, perp)
-				if finalDist < 1.3 || finalDist > 1.65 {
-					continue
-				}
-				nc := clashPts(pts)
-				if nc > 0 {
-					continue // reject any clash with protein
-				}
-				dev := math.Abs(finalDist - bondLen)
-				torDev := junctionTorsionDev(pts)
-				burial := burialScore(pts)
-				// Priority: 1) most buried, 2) best torsions, 3) best bond length
-				if nc < bestClash ||
-					(nc == bestClash && burial > bestBurial) ||
-					(nc == bestClash && burial == bestBurial && torDev < bestTorDev) ||
-					(nc == bestClash && burial == bestBurial && torDev == bestTorDev && dev < bestFinalDev) {
-					bestClash = nc
-					bestFinalDev = dev
-					bestTorDev = torDev
-					bestBurial = burial
-					bestPts = pts
-					bestNInter = tryN
-				}
-			}
-		}
-		if bestPts == nil {
-			// Straight zigzag found no clash-free orientation — try beam-search
-			// pathfinding that can navigate around protein obstacles.
-			maxSearch := int(math.Ceil(firstAtomPos.Sub(lastAtomPos).Norm()/1.54)) + 3
-			if maxSearch > 20 {
-				maxSearch = 20
-			}
-			bestPts = buildChainPath(firstAtomPos, lastAtomPos, firstAtomDir, maxSearch, grid)
-			if bestPts == nil || len(bestPts) > 9 {
-				return
-			}
-			nInter = len(bestPts)
-		} else {
-			nInter = bestNInter
-		}
-
-		// Final validation: confirm the actual endpoint bond is valid.
-		var actualFinalPos Vec3
-		if len(bestPts) == 0 {
-			actualFinalPos = pos1
-		} else {
-			actualFinalPos = bestPts[len(bestPts)-1]
-		}
-		finalBondLen := actualFinalPos.Sub(lastAtomPos).Norm()
-		if finalBondLen < 1.3 || finalBondLen > 1.65 {
-				return
-			}
-
-		// Build clash mask for best orientation.
-		chainPts := bestPts
+		// Region B below re-adds the two end-cap atoms and bonds the interior; the
+		// builder guarantees clash-free geometry, so chainClash is all-false.
+		chainPts := fullChain[1 : len(fullChain)-1]
 		chainClash := make([]bool, len(chainPts))
-		for k, pt := range chainPts {
-			chainClash[k] = !grid.clashFree(pt, vdw("C"), hardTol)
-		}
-
-		// Count clashing intermediate atoms.
-		nClash := 0
-		for _, cl := range chainClash {
-			if cl {
-				nClash++
-			}
-		}
-		// Reject if any intermediate atom clashes with the protein.
-			if nClash > 0 {
-				return
-			}
+		nInter := len(chainPts)
 
 		// ── Try unsaturated linkers first (shorter, straighter) ─────────────
 		// Only attempt if the chain axis aligns reasonably with both tail atoms'
@@ -2106,6 +2143,29 @@ func linkMoleculeGroups(mols []ProbeSet, proteinHeavy []heavyAtom, maxDist float
 		return preferDir
 	}
 
+	// Attachment eligibility: only atoms with spare valence may be linked (so a
+	// later bond never over-fills an atom and forces sanitizeValence to strip a
+	// ring bond), preferring non-ring carbons. Same policy as linkProbeGroups.
+	valences := make([][]int, len(mols))
+	cores := make([][]bool, len(mols))
+	for i := range mols {
+		valences[i] = atomValences(len(mols[i].Pos), mols[i].Bonds)
+		cores[i] = ringCoreAtoms(molAdj(mols[i]))
+	}
+	penalty := func(mi, idx int) (float64, bool) {
+		if valences[mi][idx]+1 > maxValence(mols[mi].Labels[idx]) {
+			return 0, false
+		}
+		pen := 0.0
+		if strings.ToUpper(mols[mi].Labels[idx]) != "C" {
+			pen += 1.0
+		}
+		if cores[mi][idx] {
+			pen += 1.5
+		}
+		return pen, true
+	}
+
 	type candidate struct {
 		i, j   int
 		a1, a2 int
@@ -2114,18 +2174,31 @@ func linkMoleculeGroups(mols []ProbeSet, proteinHeavy []heavyAtom, maxDist float
 	var cands []candidate
 	for i := 0; i < len(mols); i++ {
 		for j := i + 1; j < len(mols); j++ {
+			bestCost := math.MaxFloat64
 			bestD := math.MaxFloat64
 			bestA1, bestA2 := -1, -1
-			for a1, p1 := range mols[i].Pos {
-				for a2, p2 := range mols[j].Pos {
-					d := p1.Sub(p2).Norm()
-					if d >= 2.0 && d < bestD {
+			for a1 := range mols[i].Pos {
+				pi, oki := penalty(i, a1)
+				if !oki {
+					continue
+				}
+				for a2 := range mols[j].Pos {
+					pj, okj := penalty(j, a2)
+					if !okj {
+						continue
+					}
+					d := mols[i].Pos[a1].Sub(mols[j].Pos[a2]).Norm()
+					if d < 2.0 || d > maxDist {
+						continue
+					}
+					if cost := d + pi + pj; cost < bestCost {
+						bestCost = cost
 						bestD = d
 						bestA1, bestA2 = a1, a2
 					}
 				}
 			}
-			if bestA1 >= 0 && bestD <= maxDist {
+			if bestA1 >= 0 {
 				cands = append(cands, candidate{i, j, bestA1, bestA2, bestD})
 			}
 		}
@@ -2162,157 +2235,14 @@ func linkMoleculeGroups(mols []ProbeSet, proteinHeavy []heavyAtom, maxDist float
 			firstAtomPos := pos1.Add(firstAtomDir.Scale(1.54))
 			lastAtomPos := pos2.Add(lastAtomDir.Scale(1.54))
 
-			const (
-				bondLen = 1.54
-				cosA    = 0.8165
-				sinA    = 0.578
-			)
-			remDist := firstAtomPos.Sub(lastAtomPos).Norm()
-			nBase := int(math.Round(remDist/1.258)) - 1
-			if nBase < 0 {
-				nBase = 0
-			}
-			nInter := nBase
-			if nInter == 0 && remDist > 1.60 {
-				nInter = 1
-			}
-			remAxis := lastAtomPos.Sub(firstAtomPos).unit()
-
-			basePerp := func() Vec3 {
-				away := firstAtomDir.Sub(remAxis.Scale(firstAtomDir.Dot(remAxis)))
-				if away.Norm() > 0.1 {
-					return away.Scale(-1).unit()
-				}
-				return perpendicular(remAxis)
-			}()
-			perp2 := cross3(remAxis, basePerp).unit()
-
-			sRatio := func(n int) float64 {
-				type pt2 struct{ u, v float64 }
-				local := make([]pt2, n+2)
-				for k := 1; k <= n+1; k++ {
-					sign := 1.0
-					if (k-1)%2 == 1 {
-						sign = -1
-					}
-					local[k] = pt2{local[k-1].u + cosA * bondLen, local[k-1].v + sign*sinA*bondLen}
-				}
-				eu, ev := local[n+1].u, local[n+1].v
-				return remDist / math.Sqrt(eu*eu+ev*ev)
-			}
-
-			buildZigzag := func(n int, perpV Vec3) ([]Vec3, float64) {
-				if n == 0 {
-					return nil, firstAtomPos.Sub(lastAtomPos).Norm()
-				}
-				type pt2 struct{ u, v float64 }
-				local := make([]pt2, n+2)
-				for k := 1; k <= n+1; k++ {
-					sign := 1.0
-					if (k-1)%2 == 1 {
-						sign = -1
-					}
-					local[k] = pt2{local[k-1].u + cosA*bondLen, local[k-1].v + sign*sinA*bondLen}
-				}
-				eu, ev := local[n+1].u, local[n+1].v
-				idealLen := math.Sqrt(eu*eu + ev*ev)
-				s := remDist / idealLen
-				cosθ := eu / idealLen
-				sinθ := ev / idealLen
-				pts := make([]Vec3, n)
-				for k := 1; k <= n; k++ {
-					u, v := local[k].u, local[k].v
-					ru := (u*cosθ + v*sinθ) * s
-					rv := (-u*sinθ + v*cosθ) * s
-					pts[k-1] = firstAtomPos.Add(remAxis.Scale(ru)).Add(perpV.Scale(rv))
-				}
-				return pts, pts[n-1].Sub(lastAtomPos).Norm()
-			}
-
-			clashFree := func(pts []Vec3) bool {
-				for _, pt := range pts {
-					if !grid.clashFree(pt, vdw("C"), hardTol) {
-						return false
-					}
-				}
-				return true
-			}
-
-			// Pre-check any valid orientation exists.
-			anyValid := false
-			for tryN := nInter - 3; tryN <= nInter+3 && !anyValid; tryN++ {
-				if tryN < 0 || tryN > 9 {
-					continue
-				}
-				s := sRatio(tryN)
-				if s < 0.85 || s > 1.15 {
-					continue
-				}
-				for oi := 0; oi < 36 && !anyValid; oi++ {
-					ang := float64(oi) * math.Pi / 18
-					tp := basePerp.Scale(math.Cos(ang)).Add(perp2.Scale(math.Sin(ang)))
-					_, d := buildZigzag(tryN, tp)
-					if d >= 1.3 && d <= 1.65 {
-						anyValid = true
-						nInter = tryN
-					}
-				}
-			}
-			if !anyValid {
+			// Tetrahedral linker respecting both probe atoms' exit tangents; the
+			// merge-bonding below re-adds the two end-cap atoms and the interior.
+			fullChain := buildLinkerChain(pos1, firstAtomDir, pos2, lastAtomDir, grid, 9)
+			if fullChain == nil {
 				return
 			}
-
-			// Main search: find best orientation (fewest clashes, most buried).
-			var bestPts []Vec3
-			bestClash := math.MaxInt32
-			bestBurial := -1
-			bestFinalDev := math.MaxFloat64
-			bestNInter := nInter
-
-			for _, tryN := range []int{nInter - 3, nInter - 2, nInter - 1, nInter, nInter + 1, nInter + 2, nInter + 3} {
-				if tryN < 0 || tryN > 9 {
-					continue
-				}
-				s := sRatio(tryN)
-				if s < 0.85 || s > 1.15 {
-					continue
-				}
-				for oi := 0; oi < 36; oi++ {
-					ang := float64(oi) * math.Pi / 18
-					perp := basePerp.Scale(math.Cos(ang)).Add(perp2.Scale(math.Sin(ang)))
-					pts, finalDist := buildZigzag(tryN, perp)
-					if finalDist < 1.3 || finalDist > 1.65 {
-						continue
-					}
-					if !clashFree(pts) {
-						continue
-					}
-					dev := math.Abs(finalDist - bondLen)
-					burial := grid.countNearby(firstAtomPos, 2.0, 6.0)
-					nc := 0
-					if nc < bestClash || (nc == bestClash && burial > bestBurial) ||
-						(nc == bestClash && burial == bestBurial && dev < bestFinalDev) {
-						bestClash = nc
-						bestFinalDev = dev
-						bestBurial = burial
-						bestPts = pts
-						bestNInter = tryN
-					}
-				}
-			}
-			if bestPts == nil {
-				maxSearch := int(math.Ceil(remDist/1.54)) + 3
-				if maxSearch > 20 {
-					maxSearch = 20
-				}
-				bestPts = buildChainPath(firstAtomPos, lastAtomPos, firstAtomDir, maxSearch, grid)
-				if bestPts == nil || len(bestPts) > 9 {
-					return
-				}
-				nInter = len(bestPts)
-			} else {
-				nInter = bestNInter
-			}
+			bestPts := fullChain[1 : len(fullChain)-1]
+			nInter := len(bestPts)
 
 			// Validate final bond length.
 			var actualFinal Vec3

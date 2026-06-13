@@ -330,15 +330,22 @@ func main() {
 	// picked up by linking get written as-is for visual inspection).
 	allPairs := append(append(pairs, ringScanPairs...), chainScanned...)
 
-	// Fuse atoms that are within 0.7 Å of each other (overlapping ring/carbonyl atoms),
-	// then sanitize any valence overflows introduced by fusion.
+	// Fuse atoms that are within 0.7 Å of each other (overlapping ring/carbonyl
+	// atoms), then sanitize any valence overflows introduced by fusion. Fusion is
+	// opportunistic: it keeps one of the two overlapping atoms' positions, so it
+	// can leave the inherited bonds at strained angles. We accept a fusion only
+	// when the result is geometrically sane; otherwise we keep the unfused
+	// molecule (which the geometry gate below will still vet).
 	nFused := 0
 	for i := range allPairs {
-		fused := fuseOverlapping(allPairs[i], 0.7)
-		if len(fused.Pos) < len(allPairs[i].Pos) {
+		base := sanitizeValence(allPairs[i])
+		fused := sanitizeValence(fuseOverlapping(allPairs[i], 0.7))
+		if len(fused.Pos) < len(allPairs[i].Pos) && geometryOK(fused) {
+			allPairs[i] = fused
 			nFused++
+		} else {
+			allPairs[i] = base
 		}
-		allPairs[i] = sanitizeValence(fused)
 	}
 	if nFused > 0 {
 		fmt.Printf("Fused overlapping atoms in %d molecules\n", nFused)
@@ -351,30 +358,73 @@ func main() {
 	// construction. Grown/closed/chain-scanned variants are kept as long as they
 	// are connected.
 	var connPairs []ProbeSet
+	nBadGeom := 0
 	for _, p := range allPairs {
-		if isConnected(p) {
-			connPairs = append(connPairs, p)
+		if !isConnected(p) {
+			continue
+		}
+		if !geometryOK(p) {
+			nBadGeom++
+			continue
+		}
+		connPairs = append(connPairs, p)
+	}
+	fmt.Printf("Connected molecules: %d / %d (dropped %d for strained geometry)\n",
+		len(connPairs), len(allPairs), nBadGeom)
+	allPairs = connPairs
+	tick("connectivity + geometry filter")
+
+	// Surface the individual probes as standalone molecules — otherwise small
+	// probes (hydroxyl, methoxy) that are never linked never appear at all.
+	standaloneProbes := probeComponents(ps.Pos, ps.Labels, ps.Bonds, linkableN)
+	// Hold standalone probes to the same geometry bar as everything else; this
+	// drops the hydrophobic alkane-chain probes, which connect hydrophobic hotspots
+	// rather than forming a tetrahedral chain and so contain strained angles.
+	keptProbes := standaloneProbes[:0]
+	for _, sp := range standaloneProbes {
+		if geometryOK(sp) {
+			keptProbes = append(keptProbes, sp)
 		}
 	}
-	fmt.Printf("Connected molecules: %d / %d\n", len(connPairs), len(allPairs))
-	allPairs = connPairs
-	tick("connectivity filter")
+	standaloneProbes = keptProbes
+	fmt.Printf("Standalone probe molecules: %d\n", len(standaloneProbes))
+	allPairs = append(allPairs, standaloneProbes...)
 
 	if err := WriteSDF(outPath, ps, allPairs); err != nil {
 		fmt.Fprintf(os.Stderr, "Error writing SDF: %v\n", err)
 		os.Exit(1)
 	}
-	fmt.Printf("Wrote %d probe atoms + %d linked pairs + %d ring variants -> %s\n",
-		ps.Len(), len(pairs), len(ringScanPairs), outPath)
+	fmt.Printf("Wrote %d probe atoms + %d linked pairs + %d ring variants + %d standalone probes -> %s\n",
+		ps.Len(), len(pairs), len(ringScanPairs), len(standaloneProbes), outPath)
 	tick("write SDF")
 }
 
 // sanitizeValence removes excess bonds from over-valent atoms.
-// Bonds are processed highest-order first so double bonds (C=O, C=N) are
-// preserved over single bonds when an atom is over its element maximum.
+// Cyclic (ring) bonds are processed first so their valence budget is reserved —
+// otherwise an extra bond introduced by linking/fusion/growing could over-fill a
+// ring atom and cause a ring bond to be dropped, breaking the ring. Within that,
+// higher-order bonds are processed first so double bonds (C=O, C=N) are preserved
+// over single bonds when an atom is over its element maximum.
 func sanitizeValence(mol ProbeSet) ProbeSet {
-	maxVal := map[string]int{"C": 4, "N": 3, "O": 2, "S": 2, "F": 1, "CL": 1, "BR": 1}
+	maxVal := map[string]int{"C": 4, "N": 3, "O": 2, "S": 6, "F": 1, "CL": 1, "BR": 1}
 	n := len(mol.Pos)
+
+	// A bond is cyclic if both endpoints survive in the 2-core of the bond graph
+	// (degree-1 atoms iteratively pruned). This protects every true ring bond.
+	adj := make([][]int, n)
+	for _, b := range mol.Bonds {
+		i, j := b.I-1, b.J-1
+		if i < 0 || j < 0 || i >= n || j >= n {
+			continue
+		}
+		adj[i] = append(adj[i], j)
+		adj[j] = append(adj[j], i)
+	}
+	inCore := ringCoreAtoms(adj)
+	cyclic := func(b Bond) bool {
+		i, j := b.I-1, b.J-1
+		return i >= 0 && j >= 0 && i < n && j < n && inCore[i] && inCore[j]
+	}
 
 	type idxBond struct {
 		b   Bond
@@ -384,8 +434,12 @@ func sanitizeValence(mol ProbeSet) ProbeSet {
 	for k, b := range mol.Bonds {
 		sorted[k] = idxBond{b, k}
 	}
-	// Process highest-order bonds first so they are reserved for valence budget.
+	// Ring bonds first (reserve their budget), then highest-order first.
 	sort.Slice(sorted, func(i, j int) bool {
+		ci, cj := cyclic(sorted[i].b), cyclic(sorted[j].b)
+		if ci != cj {
+			return ci
+		}
 		return sorted[i].b.Order > sorted[j].b.Order
 	})
 
@@ -535,6 +589,151 @@ func isConnected(mol ProbeSet) bool {
 		}
 	}
 	return count == n
+}
+
+// probeComponents splits the first `limit` atoms of a probe set (the
+// pharmacophore probes, before the backbone is appended) into their connected
+// components and returns each as a standalone molecule named by molName. This is
+// what surfaces the individual probes — especially the small ones (hydroxyl,
+// methoxy) that are too few atoms to ever be linked into a larger molecule and so
+// would otherwise never appear in the output at all.
+func probeComponents(pos []Vec3, labels []string, bonds []Bond, limit int) []ProbeSet {
+	if limit > len(pos) {
+		limit = len(pos)
+	}
+	parent := make([]int, limit)
+	for i := range parent {
+		parent[i] = i
+	}
+	var find func(int) int
+	find = func(x int) int {
+		for parent[x] != x {
+			parent[x] = parent[parent[x]]
+			x = parent[x]
+		}
+		return x
+	}
+	for _, b := range bonds {
+		i, j := b.I-1, b.J-1
+		if i < 0 || j < 0 || i >= limit || j >= limit {
+			continue
+		}
+		parent[find(i)] = find(j)
+	}
+	groups := map[int][]int{}
+	for i := 0; i < limit; i++ {
+		r := find(i)
+		groups[r] = append(groups[r], i)
+	}
+	// Deterministic order: by smallest member index.
+	roots := make([]int, 0, len(groups))
+	for r := range groups {
+		roots = append(roots, r)
+	}
+	sort.Ints(roots)
+
+	var out []ProbeSet
+	for _, r := range roots {
+		members := groups[r]
+		idxMap := make(map[int]int, len(members))
+		var ps ProbeSet
+		for _, m := range members {
+			idxMap[m] = ps.Add(pos[m], labels[m])
+		}
+		for _, b := range bonds {
+			i, j := b.I-1, b.J-1
+			if ni, ok := idxMap[i]; ok {
+				if nj, ok2 := idxMap[j]; ok2 {
+					ps.Bond(ni, nj, b.Order)
+				}
+			}
+		}
+		name := molName(ps.Labels)
+		// Distinguish a bridging-O ether (methoxy, C–O–C) from a terminal-O
+		// alcohol (hydroxyl, C–OH); molName lumps both as "hydroxyl".
+		if name == "hydroxyl" {
+			deg := make([]int, ps.Len())
+			for _, b := range ps.Bonds {
+				deg[b.I-1]++
+				deg[b.J-1]++
+			}
+			for i, l := range ps.Labels {
+				if strings.ToUpper(l) == "O" && deg[i] == 2 {
+					name = "methoxy"
+					break
+				}
+			}
+		}
+		ps.Name = "probe-" + name
+		ps.ParentIdx = -1
+		out = append(out, ps)
+	}
+	return out
+}
+
+// covRadius holds covalent radii (Å) used to validate bond lengths.
+var covRadius = map[string]float64{
+	"C": 0.76, "N": 0.71, "O": 0.66, "S": 1.05,
+	"F": 0.57, "CL": 1.02, "BR": 1.20, "P": 1.07, "SE": 1.20,
+}
+
+func covR(elem string) float64 {
+	if r, ok := covRadius[strings.ToUpper(elem)]; ok {
+		return r
+	}
+	return 0.77
+}
+
+// geometryOK rejects molecules whose downstream bond formation (linking, ring
+// closure, fusion, growth) produced unphysical geometry: a bond far longer than
+// the covalent ideal, or a bond angle so acute it cannot be a real conformation.
+// These bonds are added purely on inter-atomic distance with no angular control,
+// so this gate is what keeps strained artifacts out of the output.
+func geometryOK(mol ProbeSet) bool {
+	const (
+		minAngleDeg = 82.0 // below this, the angle is unphysical (4-rings ≈ 90° pass)
+		lenTol      = 0.40 // Å slack above the covalent-radii sum for a single bond
+	)
+	n := len(mol.Pos)
+	adj := make([][]int, n)
+	for _, b := range mol.Bonds {
+		i, j := b.I-1, b.J-1
+		if i < 0 || j < 0 || i >= n || j >= n {
+			continue
+		}
+		d := mol.Pos[i].Sub(mol.Pos[j]).Norm()
+		// Order 2/3 bonds are shorter, so the single-bond ideal is a safe upper bound.
+		if d > covR(mol.Labels[i])+covR(mol.Labels[j])+lenTol {
+			return false
+		}
+		adj[i] = append(adj[i], j)
+		adj[j] = append(adj[j], i)
+	}
+	cosMax := math.Cos(minAngleDeg * math.Pi / 180)
+	// A divalent oxygen (ether/ester) is sp3-bent; ≥150° is unphysical (linear O).
+	cosOLinear := math.Cos(150.0 * math.Pi / 180)
+	for c := 0; c < n; c++ {
+		nb := adj[c]
+		isDivalentO := strings.ToUpper(mol.Labels[c]) == "O" && len(nb) == 2
+		for a := 0; a < len(nb); a++ {
+			for b := a + 1; b < len(nb); b++ {
+				u := mol.Pos[nb[a]].Sub(mol.Pos[c])
+				v := mol.Pos[nb[b]].Sub(mol.Pos[c])
+				du, dv := u.Norm(), v.Norm()
+				if du < 1e-6 || dv < 1e-6 {
+					return false
+				}
+				cosA := u.Dot(v) / (du * dv)
+				if cosA > cosMax { // angle < minAngleDeg
+					return false
+				}
+				if isDivalentO && cosA < cosOLinear { // angle > 150° on an ether O
+					return false
+				}
+			}
+		}
+	}
+	return true
 }
 
 // ── Hydrophobic alkane chain ──────────────────────────────────────────────────

@@ -169,6 +169,18 @@ func hbondRole(a Atom) string {
 	name := strings.TrimSpace(strings.ToUpper(a.Name))
 	switch elem {
 	case "N":
+		// Sidechain amine/amide/indole nitrogens are donor-only; classifying
+		// them as "dual" would wrongly place donor probes against them.
+		// HIS ND1/NE2 are genuinely tautomer-dependent, so they stay dual.
+		res := strings.TrimSpace(strings.ToUpper(a.ResName))
+		switch res + ":" + name {
+		case "ARG:NE", "ARG:NH1", "ARG:NH2",
+			"LYS:NZ",
+			"TRP:NE1",
+			"ASN:ND2",
+			"GLN:NE2":
+			return "donor"
+		}
 		return "dual"
 	case "O":
 		if name == "OXT" {
